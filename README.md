@@ -302,5 +302,3 @@ Reload an existing TUI session with `/reload`.
 npm run check
 npm pack --dry-run
 ```
-
-Research artifacts under `research/` record the behavioral evidence used to design the orchestration policy. They are excluded from package publication and runtime loading.
