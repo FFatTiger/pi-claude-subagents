@@ -1,0 +1,7 @@
+node_modules/
+coverage/
+*.log
+*.tgz
+.DS_Store
+.pi-subagents/
+vendor/

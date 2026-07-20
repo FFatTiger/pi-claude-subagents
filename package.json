@@ -1,0 +1,58 @@
+{
+  "name": "pi-claude-subagents",
+  "version": "0.2.2",
+  "description": "Claude-inspired subagent orchestration implemented strictly with Pi-native sessions, tools, resources, and lifecycle semantics",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FFatTiger/pi-claude-subagents.git"
+  },
+  "bugs": {
+    "url": "https://github.com/FFatTiger/pi-claude-subagents/issues"
+  },
+  "homepage": "https://github.com/FFatTiger/pi-claude-subagents#readme",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "subagents",
+    "agents",
+    "claude-code"
+  ],
+  "files": [
+    "src/**/*.ts",
+    "agents/**/*.md",
+    "README.md",
+    "DESIGN.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "check": "npm run typecheck && npm test"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.80.6",
+    "@earendil-works/pi-ai": "0.80.6",
+    "@earendil-works/pi-coding-agent": "0.80.6",
+    "@earendil-works/pi-tui": "0.80.6",
+    "@types/node": "24.12.4",
+    "typebox": "1.1.38",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
