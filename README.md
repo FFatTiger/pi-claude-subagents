@@ -284,12 +284,40 @@ Defaults leave timeout, turn, tool, and cleanup budgets unset so ordinary work i
 
 ## Install
 
+This package can conflict with the separate `pi-subagents` package. Remove it first if installed:
+
 ```bash
 pi remove npm:pi-subagents
+```
+
+### Local path
+
+```bash
 pi install /absolute/path/to/pi-claude-subagents
 ```
 
+### Git
+
+```bash
+pi install git:github.com/FFatTiger/pi-claude-subagents@v0.2.3
+# or:
+pi install https://github.com/FFatTiger/pi-claude-subagents@v0.2.3
+```
+
+### npm
+
+```bash
+pi install npm:pi-claude-subagents@0.2.3
+```
+
 Reload an existing TUI session with `/reload`.
+
+After install, verify discovery:
+
+```text
+/pi-subagents-doctor
+/agents
+```
 
 ## Commands
 
