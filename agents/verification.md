@@ -1,7 +1,6 @@
 ---
 name: verification
 description: "Independent adversarial verifier for non-trivial implementations. Use after broad file changes or backend/API, infrastructure, migration, security, concurrency, or persistence work; pass the original request, changed files, approach, and plan/spec."
-model: huu-grok/grok-4.5
 tools: read, bash, grep, find, ls
 readonly: true
 shellPolicy: verify

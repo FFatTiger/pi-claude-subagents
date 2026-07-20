@@ -1,7 +1,6 @@
 ---
 name: general-purpose
 description: "General-purpose agent for researching complex questions, uncertain code searches, and autonomous multi-step tasks. Use when no narrower specialist fits or the right file or match may take several attempts to find."
-model: huu-grok/grok-4.5
 tools: "*"
 context: fresh
 ---

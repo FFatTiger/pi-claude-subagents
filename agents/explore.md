@@ -1,7 +1,6 @@
 ---
 name: Explore
 description: "Fast read-only codebase explorer for file discovery, symbol search, code-path tracing, and repository questions. State desired thoroughness: quick, medium, or very thorough."
-model: huu-grok/grok-4.5
 tools: read, bash, grep, find, ls
 readonly: true
 shellPolicy: inspect
