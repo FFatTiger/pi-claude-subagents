@@ -1,23 +1,57 @@
 # pi-claude-subagents
 
-A standalone Pi package for specialist agents, inherited-context workers, parallel investigation, background completion, continuation, verification, and bounded nesting. The runtime is implemented with Pi Extension API and SDK primitives.
+Pi package for multi-agent orchestration: specialist roles, inherited-context workers, parallel investigation, background completion, continuation, verification, and bounded nesting — all on Pi-native sessions, tools, and lifecycle.
 
-## Architecture
+Compatible with Pi packages around **0.80.10**. MIT license.
 
-The package registers four tools:
+## Install
 
-- `Agent` — launch a named Fresh agent, an inherited-context Fork worker, or a parallel task set
-- `SendMessage` — continue a live or persisted resumable agent
-- `TaskOutput` — inspect a task snapshot for an explicit status request or operational diagnosis; normal background completion is automatic
-- `TaskStop` — stop a live task and preserve its partial output
+This package conflicts with the separate `pi-subagents` package. Remove it first if installed:
 
-Root orchestration runs as a Pi extension. Each child runs in its own Pi `AgentSession`. Task metadata and output are persisted under `getAgentDir()`. Parent and child sessions share explicit trust, model, thinking, budget, ancestry, and concurrency state.
+```bash
+pi remove npm:pi-subagents
+```
 
-## Dispatch model
+Pick one install path:
 
-### Fresh
+```bash
+# npm
+pi install npm:pi-claude-subagents@0.2.4
 
-A named agent starts with its role prompt, task brief, selected Pi skills, working directory, and execution boundary.
+# GitHub release
+pi install git:github.com/FFatTiger/pi-claude-subagents@v0.2.4
+
+# local checkout
+pi install /absolute/path/to/pi-claude-subagents
+```
+
+Reload an existing TUI session with `/reload`, then verify discovery:
+
+```text
+/pi-subagents-doctor
+/agents
+```
+
+Success looks like: doctor reports this package’s agents and config, and `/agents` lists `Explore`, `Plan`, `verification`, `general-purpose`, and any project/user overrides.
+
+## What you get
+
+Four tools on the parent session:
+
+| Tool | Purpose |
+| --- | --- |
+| `Agent` | Launch a named Fresh agent, an inherited-context Fork, or a parallel task set |
+| `SendMessage` | Continue a live or persisted resumable agent |
+| `TaskOutput` | Snapshot a task for explicit status / ops diagnosis (not a polling loop) |
+| `TaskStop` | Stop a live task and keep partial output |
+
+Root orchestration is a Pi extension. Each child runs in its own Pi `AgentSession`. Metadata and output live under `getAgentDir()`. Parent and child share explicit trust, model, thinking, budget, ancestry, and concurrency state.
+
+## Quick usage
+
+### Fresh specialist
+
+Omit `subagent_type` for `general-purpose`.
 
 ```json
 {
@@ -27,11 +61,9 @@ A named agent starts with its role prompt, task brief, selected Pi skills, worki
 }
 ```
 
-Omitted `subagent_type` selects `general-purpose`.
+### Fork (inherited context)
 
-### Fork
-
-An inherited-context worker starts from the current persisted Pi session branch:
+Uses Pi `SessionManager.createBranchedSession()`. The child gets the parent conversation branch, effective system prompt, model, and thinking level.
 
 ```json
 {
@@ -42,9 +74,9 @@ An inherited-context worker starts from the current persisted Pi session branch:
 }
 ```
 
-Fork construction uses Pi `SessionManager.createBranchedSession()`. The child receives the parent conversation branch, effective system prompt, model, and thinking level.
+### Parallel fan-out
 
-### Parallel
+TUI and RPC default to background. Print and JSON modes run synchronously. Background completion arrives as a parent follow-up notification — do not poll `TaskOutput`.
 
 ```json
 {
@@ -68,44 +100,50 @@ Fork construction uses Pi `SessionManager.createBranchedSession()`. The child re
 }
 ```
 
-TUI and RPC launches default to background execution. Print and JSON modes execute synchronously. Background completion is delivered to the parent session as a follow-up task notification.
+### Continue / stop
+
+```json
+{ "to": "task-id-or-name", "message": "Apply the fix and run the focused regression test." }
+```
+
+```json
+{ "task_id": "task-id" }
+```
+
+`TaskOutput` is for explicit status requests or diagnosis. If the result is required before the next step, launch with `run_in_background: false`.
 
 ## Built-in roles
 
 | Agent | Role |
-|---|---|
-| `general-purpose` | Complex research, uncertain searches, dependent implementation, and validation |
-| `Explore` | Read-only file discovery, code search, and code-path tracing; one-shot |
-| `Plan` | Read-only architecture and planning research; one-shot |
+| --- | --- |
+| `general-purpose` | Complex research, uncertain searches, dependent implementation, validation |
+| `Explore` | Read-only discovery and code-path tracing; one-shot |
+| `Plan` | Read-only architecture / planning research; one-shot |
 | `verification` | Independent command-evidence verification; background by default |
-| `fork` | Synthetic inherited-context worker built from the current Pi session branch |
+| `fork` | Synthetic inherited-context worker from the current session branch |
 
-The role and orchestration prompts are source-backed behavioral reconstructions adapted to exact Pi tools and lifecycle semantics. Native Claude Code constraints are retained when they define architecture or failure prevention; Claude-specific paths, configuration, memory, hooks, permissions, and MCP conventions are not runtime inputs.
+Role and orchestration prompts are source-backed behavioral reconstructions adapted to Pi tools and lifecycle. Architecture-relevant constraints stay; Claude-specific paths, memory, hooks, permissions, and MCP conventions are not runtime inputs.
 
-## Orchestration policy
+## When the parent delegates
 
-The parent prompt uses concrete dispatch timing rather than a generic “delegate when useful” rule:
+The injected parent policy is concrete, not “delegate when useful”:
 
-- delegate open-ended, cross-module, context-heavy, or path-uncertain investigation before extensive parent searching
-- immediately fan out two or more independent questions in one `tasks` array call
-- use two or three non-overlapping investigation angles when they add real coverage
-- obtain and synthesize research before assigning dependent implementation
-- delegate implementation requiring more than a couple of edits, isolation, broad validation, or substantial intermediate output unless tightly scoped
-- handle known-file reads, specific symbols, two-or-three-known-file inspection, and small edits directly
-- launch independent verification at the configured threshold or high-risk boundary without waiting for the user
-- never poll, peek, duplicate, or predict background results
-- inherit role and runtime defaults for normal work; set optional budgets only for intentionally bounded probes while leaving implementation room for validation
-- preserve complete Fresh briefs, inherited-context Fork directives, continuation, parent-owned synthesis, and bounded nesting
+- Delegate open-ended, cross-module, context-heavy, or path-uncertain investigation early
+- Fan out two or more independent questions in one `tasks` array call
+- Synthesize research before assigning dependent implementation
+- Delegate multi-edit / isolation / broad validation work unless tightly scoped
+- Handle known-file reads, small symbol lookups, and small edits directly
+- Launch verification at the configured threshold or high-risk boundary without waiting for the user
+- Never poll, peek, duplicate, or invent background results
+- Parent owns understanding, synthesis, final validation, and delivery
 
-## Agent definitions
+## Custom agent definitions
 
-Discovery precedence:
+Discovery order (closest wins):
 
 1. bundled `agents/`
 2. `${getAgentDir()}/agents/`
-3. trusted project `.pi/agents/` from repository root toward the current working directory
-
-The closest definition wins.
+3. trusted project `.pi/agents/` from repository root toward cwd
 
 ```markdown
 ---
@@ -130,118 +168,64 @@ timeoutMs: 900000
 Review the assigned change and return an evidence-based report.
 ```
 
-Supported fields:
+Supported frontmatter: `name`, `description`, `tools`, `disallowedTools`, `model`, `thinking`, `skills`, `readonly`, `shellPolicy`, `background`, `context`, `isolation`, `maxTurns`, `graceTurns`, `maxToolCalls`, `softToolCalls`, `toolBudgetBlock`, `timeoutMs`, `oneShot`.
 
-- `name`, `description`
-- `tools`, `disallowedTools`
-- `model`, `thinking`
-- `skills`
-- `readonly`, `shellPolicy`
-- `background`, `context`, `isolation`
-- `maxTurns`, `graceTurns`, `maxToolCalls`, `softToolCalls`, `toolBudgetBlock`, `timeoutMs`
-- `oneShot`
+Child coding tools are Pi-native: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, filtered by parent inventory and role definition. Nested roles may also receive the child `Agent` adapter.
 
-Tool names refer to Pi tools. The child runtime provides the Pi coding tools `read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls`, filtered by the parent active inventory and the role definition. Nested roles may also receive the child `Agent` adapter.
+### Skills
 
-## Skills
-
-Child skill discovery uses Pi `DefaultResourceLoader` and the parent project trust state. The `skills` field selects discovered Pi skills and preloads their `SKILL.md` content into the role system prompt.
-
-## Nested agents
-
-A role with `Agent` access may launch a named child role. Nested execution returns to the direct parent, which consolidates the result for its own caller.
-
-- maximum depth: 5
-- shared root concurrency quota
-- persisted `rootParentSessionId`, `parentTaskId`, and `depth`
-- named child roles
-- root-session Fork creation
-
-## Continuation and task control
-
-Continue a task:
-
-```json
-{ "to": "task-id-or-name", "message": "Apply the fix and run the focused regression test." }
-```
-
-Inspect a task only when the user explicitly asks for status or when diagnosing orchestration:
-
-```json
-{ "task_id": "task-id", "block": false }
-```
-
-Normal background completion arrives automatically. Do not build a polling loop around `TaskOutput`; if the result is required synchronously, launch the original Agent with `run_in_background: false`.
-
-Stop a task:
-
-```json
-{ "task_id": "task-id" }
-```
-
-Explore and Plan use one-shot execution. General-purpose and custom roles retain a persisted child session for continuation.
+Child skill discovery uses Pi `DefaultResourceLoader` and parent project trust. The `skills` field selects discovered Pi skills and preloads their `SKILL.md` into the role system prompt.
 
 ## Model selection
 
-Agent models resolve in this order:
+1. Explicit `Agent` call `model` override (validated against the current Pi model registry)
+2. `subagents.agentOverrides.<AgentName>.model` in Pi user/project `settings.json`
+3. Agent Markdown `model` frontmatter
+4. `subagents.defaultModel` in Pi user/project `settings.json`
+5. Current parent-session model
 
-1. a deliberate `Agent` call `model` override, validated against the current Pi model registry;
-2. `subagents.agentOverrides.<AgentName>.model` from Pi user/project `settings.json`;
-3. the Agent Markdown `model` frontmatter;
-4. `subagents.defaultModel` from Pi user/project `settings.json`;
-5. the current parent-session model.
+Omit `model` on normal calls. Unknown overrides fail before child startup. Fork always inherits parent model and thinking. Override keys must match runtime names exactly: `general-purpose`, `Explore`, `Plan`, `verification`. Legacy `pi-subagents` names (`scout`, `planner`, `reviewer`, `worker`) are ignored and reported as diagnostics.
 
-Omit `model` during normal Agent calls. The selected Agent's configured model is shown in `<agent-listing>` and by `/pi-subagents-doctor`. An unknown explicit override fails before child startup. Fork always inherits the parent model and thinking level.
+## Nested agents
 
-Override keys must match the runtime names exactly: `general-purpose`, `Explore`, `Plan`, and `verification`. Old `pi-subagents` names such as `scout`, `planner`, `reviewer`, and `worker` are ignored and reported as diagnostics.
+A role with `Agent` access may launch a named child. Nested work returns to the direct parent for consolidation.
 
-## Safety and isolation
+- Max depth: **5**
+- Shared root concurrency quota
+- Persisted `rootParentSessionId`, `parentTaskId`, `depth`
+- Named child roles; root-session Fork only at the root
+
+## Safety and lifecycle
 
 Runtime enforcement includes:
 
-- exact role tool selection
-- read-only edit/write removal
-- `inspect`, `verify`, and `unrestricted` shell policies
-- a Pi-native lifecycle controller with `starting → working → final_handoff → terminal` phases
-- optional `maxTurns` as a soft wrap-up threshold with a configurable grace window (default grace 1)
-- optional `maxToolCalls` as a hard threshold that blocks only the configured tools (default `read`, `grep`, `find`, `ls`)
-- separate requested, executed, and blocked tool-call accounting
-- a valid final report after selected-tool blocking can still complete normally
-- explicit termination kinds: `normal`, `turn_budget`, `tool_budget`, `timeout`, `manual_stop`, `parent_shutdown`, `provider_error`, and `startup_error`
-- task statuses: `running`, `completed`, `partial`, `failed`, and `stopped`
-- root-shared FIFO concurrency semaphore (default capacity 20)
-- project trust propagation
-- atomic task metadata
-- invocation-scoped output that cannot fall back to an earlier progress message
-- parent-visible output bounded to 200 KiB / 5,000 lines while the full `output.md` is retained
-- optional Git worktree isolation
+- Exact role tool selection; read-only roles lose edit/write
+- Shell policies: `inspect`, `verify`, `unrestricted`
+- Lifecycle phases: `starting → working → final_handoff → terminal`
+- Optional soft `maxTurns` + grace window (default grace 1)
+- Optional hard `maxToolCalls` that blocks only configured tools (default `read`, `grep`, `find`, `ls`)
+- Explicit termination kinds: `normal`, `turn_budget`, `tool_budget`, `timeout`, `manual_stop`, `parent_shutdown`, `provider_error`, `startup_error`
+- Task statuses: `running`, `completed`, `partial`, `failed`, `stopped`
+- Root-shared FIFO concurrency (default capacity 20)
+- Project trust propagation; atomic task metadata
+- Parent-visible output capped at 200 KiB / 5,000 lines; full `output.md` retained
+- Optional Git worktree isolation (clean trees removed; dirty trees kept and reported)
 
-Worktree tasks start from the current checkout `HEAD`. Unchanged worktrees are removed; changed worktrees are retained and reported.
+`task.json` is authoritative. Budget/timeout limits that still produced useful output are `partial`. User stop and parent shutdown are `stopped`. Provider/startup failures are `failed`.
 
-## Task lifecycle and diagnostics
+Usage fields: `toolCallsRequested`, `toolCallsExecuted`, `toolCallsBlocked`, plus compatibility `toolCalls` (= executed). Thinking is recorded as `requestedThinking`, `effectiveThinking`, and optional `thinkingClampReason`.
 
-`task.json` records the authoritative lifecycle result. Controlled budget limits and timeouts preserve useful output as `partial`; user stop and parent shutdown are `stopped`; provider and startup failures are `failed`.
-
-Tool usage fields are:
-
-- `toolCallsRequested` — every model-requested call
-- `toolCallsExecuted` — calls admitted by quota and runtime policy
-- `toolCallsBlocked` — calls rejected by budget or policy
-- `toolCalls` — compatibility alias for executed calls
-
-Thinking intent and reality are both retained as `requestedThinking`, `effectiveThinking`, and optional `thinkingClampReason`. Legacy `thinking` remains an alias for the effective value. The package reports a clamp; it does not change model metadata automatically.
-
-Task targets resolve by exact UUID, then unique UUID prefix, then unique name. Ambiguous names or prefixes return candidate IDs instead of silently selecting one.
+Task targets resolve by exact UUID → unique UUID prefix → unique name. Ambiguous names/prefixes return candidates instead of silent picks.
 
 ## Configuration
 
-Global configuration:
+Global:
 
 ```text
 <getAgentDir()>/pi-claude-subagents.json
 ```
 
-Trusted project configuration:
+Trusted project:
 
 ```text
 .pi/pi-claude-subagents.json
@@ -271,7 +255,7 @@ Trusted project configuration:
 }
 ```
 
-Defaults leave timeout, turn, tool, and cleanup budgets unset so ordinary work is governed by task scope and Pi session completion. A positive `cleanupPeriodDays` enables age-based retention cleanup. Legacy `maxOutputChars` is still accepted as a fallback for `maxOutputBytes`. Bundled roles do not declare budgets; custom frontmatter and invocation arguments can still set them.
+Defaults leave timeout, turn, tool, and cleanup budgets unset so ordinary work is governed by task scope and Pi session completion. Positive `cleanupPeriodDays` enables age-based retention cleanup. Legacy `maxOutputChars` still maps to `maxOutputBytes`. Bundled roles declare no budgets; custom frontmatter and invocation args can still set them.
 
 ## Persistence
 
@@ -282,51 +266,22 @@ Defaults leave timeout, turn, tool, and cleanup budgets unset so ordinary work i
   session.jsonl
 ```
 
-## Install
-
-This package can conflict with the separate `pi-subagents` package. Remove it first if installed:
-
-```bash
-pi remove npm:pi-subagents
-```
-
-### Local path
-
-```bash
-pi install /absolute/path/to/pi-claude-subagents
-```
-
-### Git
-
-```bash
-pi install git:github.com/FFatTiger/pi-claude-subagents@v0.2.4
-# or:
-pi install https://github.com/FFatTiger/pi-claude-subagents@v0.2.4
-```
-
-### npm
-
-```bash
-pi install npm:pi-claude-subagents@0.2.4
-```
-
-Reload an existing TUI session with `/reload`.
-
-After install, verify discovery:
-
-```text
-/pi-subagents-doctor
-/agents
-```
-
 ## Commands
 
-- `/agents`
-- `/pi-subagents-doctor`
+- `/agents` — list subagents and current tasks
+- `/pi-subagents-doctor` — inspect discovery and configuration
 
-## Validation
+## Develop / validate
+
+Requirements: Node.js `>=22.19.0`.
 
 ```bash
 npm run check
 npm pack --dry-run
 ```
+
+Architecture notes: [DESIGN.md](./DESIGN.md). Issues: [GitHub Issues](https://github.com/FFatTiger/pi-claude-subagents/issues).
+
+## License
+
+[MIT](./LICENSE) © FFatTiger
