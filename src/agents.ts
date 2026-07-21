@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AgentModelSettings } from "./config.ts";
 import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 
@@ -186,11 +187,55 @@ function projectSearchRoots(cwd: string): string[] {
   return chain.slice(0, chain.indexOf(gitRoot) + 1).reverse();
 }
 
-function sourceDirectories(cwd: string, packageRoot: string, includeProject: boolean): SourceDir[] {
-  const dirs: SourceDir[] = [
-    { dir: path.join(packageRoot, "agents"), source: "builtin" },
-    { dir: path.join(getAgentDir(), "agents"), source: "user" },
+export function resolvePackageRoot(fromUrl = import.meta.url): string {
+  const startDir = path.dirname(fileURLToPath(fromUrl));
+  let current = startDir;
+  while (true) {
+    const packageJsonPath = path.join(current, "package.json");
+    const agentsDir = path.join(current, "agents");
+    if (fs.existsSync(packageJsonPath) && fs.existsSync(agentsDir)) {
+      try {
+        const raw = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as { name?: string };
+        if (raw.name === "pi-claude-subagents" || fs.readdirSync(agentsDir).some(name => name.endsWith(".md"))) {
+          return current;
+        }
+      } catch {
+        if (fs.readdirSync(agentsDir).some(name => name.endsWith(".md"))) return current;
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+
+  const agentDir = getAgentDir();
+  const fallbacks = [
+    path.join(agentDir, "npm", "node_modules", "pi-claude-subagents"),
+    path.resolve(agentDir, "..", "pi-claude-subagents"),
+    path.resolve(startDir, ".."),
   ];
+  for (const candidate of fallbacks) {
+    if (fs.existsSync(path.join(candidate, "agents"))) return candidate;
+  }
+  return path.resolve(startDir, "..");
+}
+
+function sourceDirectories(cwd: string, packageRoot: string, includeProject: boolean): SourceDir[] {
+  const agentDir = getAgentDir();
+  const candidateRoots = [
+    packageRoot,
+    path.join(agentDir, "npm", "node_modules", "pi-claude-subagents"),
+    path.resolve(agentDir, "..", "pi-claude-subagents"),
+  ];
+  const seen = new Set<string>();
+  const dirs: SourceDir[] = [];
+  for (const root of candidateRoots) {
+    const resolved = path.resolve(root);
+    if (seen.has(resolved)) continue;
+    seen.add(resolved);
+    dirs.push({ dir: path.join(resolved, "agents"), source: "builtin" });
+  }
+  dirs.push({ dir: path.join(agentDir, "agents"), source: "user" });
   if (includeProject) {
     for (const root of projectSearchRoots(cwd)) {
       dirs.push({ dir: path.join(root, CONFIG_DIR_NAME, "agents"), source: "project" });

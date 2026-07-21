@@ -1,6 +1,6 @@
 {
   "name": "pi-claude-subagents",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Claude-inspired subagent orchestration implemented strictly with Pi-native sessions, tools, resources, and lifecycle semantics",
   "type": "module",
   "license": "MIT",
@@ -44,10 +44,10 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.80.6",
-    "@earendil-works/pi-ai": "0.80.6",
-    "@earendil-works/pi-coding-agent": "0.80.6",
-    "@earendil-works/pi-tui": "0.80.6",
+    "@earendil-works/pi-agent-core": "0.80.10",
+    "@earendil-works/pi-ai": "0.80.10",
+    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-tui": "0.80.10",
     "@types/node": "24.12.4",
     "typebox": "1.1.38",
     "typescript": "5.9.3"

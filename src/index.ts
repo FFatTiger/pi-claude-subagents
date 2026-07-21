@@ -3,14 +3,13 @@ import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   getAgentDir,
-  resolveCliModel,
   type AgentToolResult,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { applyAgentModelSettings, discoverAgents, findAgent, type AgentDefinition } from "./agents.ts";
+import { applyAgentModelSettings, discoverAgents, findAgent, resolvePackageRoot, type AgentDefinition } from "./agents.ts";
 import { agentAllowsNestedAgents, type ToolDescriptor } from "./capabilities.ts";
 import { loadAgentModelSettings, loadConfig, type PiSubagentsConfig } from "./config.ts";
 import { buildAgentListing, buildAgentToolDescription, buildParentPolicy, classifyDispatch, resolveTaskIsolation } from "./prompts.ts";
@@ -26,7 +25,7 @@ import {
   type TaskRecord,
 } from "./tasks.ts";
 
-const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const packageRoot = resolvePackageRoot(import.meta.url);
 
 interface TaskDetails {
   tasks: TaskRecord[];
@@ -188,9 +187,21 @@ function currentParent(pi: ExtensionAPI, ctx: ExtensionContext): ParentLaunchCon
 }
 
 function resolveRequestedModel(modelRef: string, registry: ExtensionContext["modelRegistry"]): string {
-  const resolved = resolveCliModel({ cliModel: modelRef, modelRegistry: registry });
-  if (resolved.error || !resolved.model) throw new Error(resolved.error ?? `Model '${modelRef}' is not available in the current Pi model registry.`);
-  return `${resolved.model.provider}/${resolved.model.id}`;
+  const value = modelRef.trim();
+  if (!value) throw new Error("Model reference is empty.");
+  const slash = value.indexOf("/");
+  if (slash > 0) {
+    const found = registry.find(value.slice(0, slash), value.slice(slash + 1));
+    if (found) return `${found.provider}/${found.id}`;
+  }
+  const models = registry.getAvailable().length > 0 ? registry.getAvailable() : registry.getAll();
+  const exact = models.filter(model => model.id === value || `${model.provider}/${model.id}` === value);
+  if (exact.length === 1) return `${exact[0].provider}/${exact[0].id}`;
+  if (exact.length > 1) throw new Error(`Model '${modelRef}' is ambiguous in the current Pi model registry.`);
+  const partial = models.filter(model => model.id.includes(value) || `${model.provider}/${model.id}`.includes(value));
+  if (partial.length === 1) return `${partial[0].provider}/${partial[0].id}`;
+  if (partial.length > 1) throw new Error(`Model '${modelRef}' is ambiguous in the current Pi model registry.`);
+  throw new Error(`Model '${modelRef}' is not available in the current Pi model registry.`);
 }
 
 function normalizeTask(input: {

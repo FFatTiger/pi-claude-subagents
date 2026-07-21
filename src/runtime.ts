@@ -4,9 +4,8 @@ import * as path from "node:path";
 import { spawn } from "node:child_process";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import {
-  AuthStorage,
   DefaultResourceLoader,
-  ModelRegistry,
+  ModelRuntime,
   SessionManager,
   SettingsManager,
   createAgentSession,
@@ -747,8 +746,10 @@ async function makeChildSession(options: {
   const containmentRoot = options.worktree?.path ?? options.spec.containmentRoot;
   if (containmentRoot) options.record.containmentRoot = containmentRoot;
   const agentDir = getAgentDir();
-  const authStorage = AuthStorage.create(path.join(agentDir, "auth.json"));
-  const modelRegistry = ModelRegistry.create(authStorage, path.join(agentDir, "models.json"));
+  const modelRuntime = await ModelRuntime.create({
+    authPath: path.join(agentDir, "auth.json"),
+    modelsPath: path.join(agentDir, "models.json"),
+  });
   const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: options.parent.projectTrusted });
   const guardFactory = createChildLifecycleExtension(options.spec.agent, options.lifecycle, {
     maxTurns: options.spec.maxTurns,
@@ -817,7 +818,7 @@ async function makeChildSession(options: {
     ? options.parent.parentModel
     : options.spec.model ?? frontmatterModel ?? options.parent.parentModel;
   if (!modelRef) throw new Error(`Unable to resolve a model for agent '${options.spec.agent.name}'.`);
-  const resolved = resolveCliModel({ cliModel: modelRef, modelRegistry });
+  const resolved = resolveCliModel({ cliModel: modelRef, modelRuntime });
   if (resolved.error || !resolved.model) throw new Error(resolved.error ?? `Unable to resolve model '${modelRef}'.`);
   const requestedThinking = asThinkingLevel(options.spec.forked
     ? options.parent.parentThinking ?? resolved.thinkingLevel
@@ -838,8 +839,7 @@ async function makeChildSession(options: {
   const result = await createAgentSession({
     cwd,
     agentDir,
-    authStorage,
-    modelRegistry,
+    modelRuntime,
     settingsManager,
     resourceLoader: loader,
     sessionManager,
@@ -1180,8 +1180,10 @@ export async function resumeCompletedTask(options: {
         if (relative.startsWith("..") || path.isAbsolute(relative)) throw new Error("Persisted worktree cwd resolves outside the isolated checkout.");
       }
       const agentDir = getAgentDir();
-      const authStorage = AuthStorage.create(path.join(agentDir, "auth.json"));
-      const modelRegistry = ModelRegistry.create(authStorage, path.join(agentDir, "models.json"));
+      const modelRuntime = await ModelRuntime.create({
+        authPath: path.join(agentDir, "auth.json"),
+        modelsPath: path.join(agentDir, "models.json"),
+      });
       const runProjectTrusted = options.record.projectTrusted ?? false;
       options.record.projectTrusted = runProjectTrusted;
       const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: runProjectTrusted });
@@ -1216,7 +1218,7 @@ export async function resumeCompletedTask(options: {
       });
       await loader.reload();
       const sessionManager = SessionManager.open(sessionFile, path.dirname(options.record.taskFile), cwd);
-      const resolved = options.record.model ? resolveCliModel({ cliModel: options.record.model, modelRegistry }) : undefined;
+      const resolved = options.record.model ? resolveCliModel({ cliModel: options.record.model, modelRuntime }) : undefined;
       const restoredTools = [...resumeTools];
       const resumeNestedTool = resumeTools.includes("Agent") && options.agents && options.parent?.taskQuota
         ? createNestedAgentAdapter({
@@ -1234,7 +1236,7 @@ export async function resumeCompletedTask(options: {
         options.record.requestedThinking ?? options.record.effectiveThinking ?? options.record.thinking,
       );
       childSession = (await createAgentSession({
-        cwd, agentDir, authStorage, modelRegistry, settingsManager, resourceLoader: loader, sessionManager,
+        cwd, agentDir, modelRuntime, settingsManager, resourceLoader: loader, sessionManager,
         model: resolved?.model, thinkingLevel: requestedThinking, tools: restoredTools,
         customTools: resumeNestedTool ? [resumeNestedTool] : undefined,
       })).session;

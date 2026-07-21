@@ -299,15 +299,15 @@ pi install /absolute/path/to/pi-claude-subagents
 ### Git
 
 ```bash
-pi install git:github.com/FFatTiger/pi-claude-subagents@v0.2.3
+pi install git:github.com/FFatTiger/pi-claude-subagents@v0.2.4
 # or:
-pi install https://github.com/FFatTiger/pi-claude-subagents@v0.2.3
+pi install https://github.com/FFatTiger/pi-claude-subagents@v0.2.4
 ```
 
 ### npm
 
 ```bash
-pi install npm:pi-claude-subagents@0.2.3
+pi install npm:pi-claude-subagents@0.2.4
 ```
 
 Reload an existing TUI session with `/reload`.

@@ -32,6 +32,20 @@ export function resolveTaskIsolation(requested: AgentRequestInput["isolation"], 
   return agentDefault;
 }
 
+export function createSyntheticForkAgent(): AgentDefinition {
+  return {
+    name: FORK_AGENT_TYPE,
+    description: "inherited-context worker created from the current persisted Pi session branch",
+    prompt: "",
+    tools: ["*"],
+    readonly: false,
+    shellPolicy: "unrestricted",
+    context: "fork",
+    source: "builtin",
+    filePath: "<fork>",
+  };
+}
+
 export function classifyDispatch(options: {
   input: AgentRequestInput;
   agents: AgentDefinition[];
@@ -50,7 +64,9 @@ export function classifyDispatch(options: {
   }
   const selected = options.agents.find(agent => agent.name === requestedType)
     ?? options.agents.find(agent => agent.name.toLowerCase() === requestedType.toLowerCase())
-    ?? (forked ? options.agents.find(agent => agent.name === "general-purpose") : undefined);
+    ?? (forked
+      ? options.agents.find(agent => agent.name === "general-purpose") ?? createSyntheticForkAgent()
+      : undefined);
   if (!selected) {
     const visible = [...options.agents.map(agent => agent.name), ...(options.config.enableFork ? [FORK_AGENT_TYPE] : [])];
     throw new Error(`Unknown agent '${requestedType}'. Available agents: ${visible.join(", ")}.`);

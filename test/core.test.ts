@@ -174,6 +174,29 @@ test("dispatch matches the Pi orchestration contract", () => {
   assert.throws(() => classifyDispatch({ input: { subagent_type: "fork" }, agents: discovered, config: DEFAULT_CONFIG, mode: "tui", parentCanFork: true, parentForked: true }), /inherited-context branching stays at the root/);
 });
 
+test("discovery falls back when packageRoot is stale", () => {
+  const result = discoverAgents({
+    cwd: packageRoot,
+    packageRoot: path.join(os.tmpdir(), "missing-pi-claude-subagents-root"),
+    includeProject: false,
+  });
+  assert.ok(result.agents.some(agent => agent.name === "Explore"));
+  assert.ok(result.agents.some(agent => agent.name === "general-purpose"));
+});
+
+test("fork dispatch works even when no named agents are discovered", () => {
+  const fork = classifyDispatch({
+    input: { subagent_type: "fork", description: "x", prompt: "y" },
+    agents: [],
+    config: DEFAULT_CONFIG,
+    mode: "tui",
+    parentCanFork: true,
+  });
+  assert.equal(fork.forked, true);
+  assert.equal(fork.agent.name, "fork");
+  assert.equal(fork.agent.filePath, "<fork>");
+});
+
 test("isolation selection honors explicit override and agent default", () => {
   assert.equal(resolveTaskIsolation(undefined, "worktree"), "worktree");
   assert.equal(resolveTaskIsolation("none", "worktree"), undefined);
