@@ -16,10 +16,10 @@ Pick one install path:
 
 ```bash
 # npm
-pi install npm:pi-claude-subagents@0.3.1
+pi install npm:pi-claude-subagents@0.3.2
 
 # GitHub release
-pi install git:github.com/FFatTiger/pi-claude-subagents@v0.3.1
+pi install git:github.com/FFatTiger/pi-claude-subagents@v0.3.2
 
 # local checkout
 pi install /absolute/path/to/pi-claude-subagents
@@ -204,9 +204,10 @@ Runtime enforcement includes:
 - Exact role tool selection; read-only roles lose edit/write
 - Shell policies: `inspect`, `verify`, `unrestricted`
 - Lifecycle phases: `starting → working → final_handoff → terminal`
-- Each root `Agent` invocation explicitly carries positive `warning_turns` and `warning_interval_turns`; use `30` and `20` for the standard policy
-- In a `tasks` array, child entries inherit the required top-level warning values unless deliberately overridden
-- Mandatory recurring progress supervision follows those supplied checkpoints
+- Each root `Agent` invocation explicitly chooses positive `warning_turns` and `warning_interval_turns` for that task instead of copying a universal pair
+- Practical starting ranges: narrow/high-risk work `8–12 / 5–8`; routine investigation `15–25 / 8–12`; broad research `25–35 / 12–20`; multi-file implementation `30–45 / 15–25`; external or deployment work `10–15 / 5–10`
+- In a `tasks` array, child entries inherit the top-level warning values unless their scope or risk materially differs
+- Mandatory recurring progress supervision follows the chosen checkpoints
 - Warnings reach the root parent without stopping the child, restricting tools, or changing task status
 - A foreground task is promoted to supervised background execution on its first warning so the parent can inspect, steer, or stop it
 - Optional soft `maxTurns` + grace window for explicit unattended policy (default grace 1)
@@ -264,7 +265,7 @@ Trusted project:
 }
 ```
 
-The public `Agent` schema requires `warning_turns` and `warning_interval_turns` on every root call; standard calls use `30` and `20`. Tasks-array entries inherit those top-level values unless deliberately overridden. Defaults leave hard timeout, turn, tool, and cleanup budgets unset. Invalid, zero, or null persisted/config warning values fall back to a positive inherited/default value rather than disabling supervision. Positive `cleanupPeriodDays` enables age-based retention cleanup. Legacy `maxOutputChars` still maps to `maxOutputBytes`. Bundled roles declare no hard budgets; custom frontmatter and runtime config can still define advanced unattended policies.
+The public `Agent` schema requires `warning_turns` and `warning_interval_turns` on every root call. The caller chooses them from task scope, uncertainty, drift/stall risk, tool cost, external waiting, and visibility of intermediate progress; it should not reuse one universal pair across unrelated tasks. Tasks-array entries inherit top-level values unless their risk materially differs. Runtime defaults remain an internal fallback for invalid persisted/config values and legacy records, not a recommendation shown to the calling model. Defaults leave hard timeout, turn, tool, and cleanup budgets unset. Positive `cleanupPeriodDays` enables age-based retention cleanup. Legacy `maxOutputChars` still maps to `maxOutputBytes`. Bundled roles declare no hard budgets; custom frontmatter and runtime config can still define advanced unattended policies.
 
 ## Persistence
 

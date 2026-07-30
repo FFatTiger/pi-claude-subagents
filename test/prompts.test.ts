@@ -47,20 +47,27 @@ test("parent policy keeps known narrow work direct and forbids polling or predic
   assert.doesNotMatch(policy, /Use agents proactively but not excessively\./);
 });
 
-test("parent policy requires explicit recurring progress supervision", () => {
+test("parent policy requires task-specific recurring progress supervision", () => {
   const policy = buildParentPolicy(agents, DEFAULT_CONFIG);
-  assert.match(policy, /root Agent call always supplies explicit positive/i);
-  assert.match(policy, /warning_turns.*warning_interval_turns/is);
-  assert.match(policy, /tasks array.*inherit.*top-level/is);
+  assert.match(policy, /chooses explicit positive warning_turns/i);
+  assert.match(policy, /scope.*uncertainty.*drift risk.*tool cost/is);
+  assert.match(policy, /narrow lookup.*8-12.*5-8/is);
+  assert.match(policy, /routine code investigation.*15-25.*8-12/is);
+  assert.match(policy, /broad cross-module research.*25-35.*12-20/is);
+  assert.match(policy, /multi-file implementation.*30-45.*15-25/is);
+  assert.match(policy, /do not mechanically reuse one pair/i);
+  assert.match(policy, /tasks array.*inherit.*materially differs/is);
   assert.match(policy, /inspect once with TaskOutput/i);
-  assert.match(policy, /continue.*SendMessage.*TaskStop/is);
-  assert.match(policy, /foreground launches release.*supervised running task/is);
 });
 
-test("short Agent description requires explicit supervision values", () => {
+test("short Agent description tells the caller how to choose supervision values", () => {
   const description = buildAgentToolDescription(agents, DEFAULT_CONFIG);
-  assert.match(description, /every root call explicitly supplies/i);
-  assert.match(description, /warning_turns.*warning_interval_turns/is);
-  assert.match(description, /tasks-array children inherit/i);
+  assert.match(description, /chooses positive warning_turns/i);
+  assert.match(description, /narrow.*8-12.*5-8/is);
+  assert.match(description, /routine investigation.*15-25.*8-12/is);
+  assert.match(description, /broad research.*25-35.*12-20/is);
+  assert.match(description, /multi-file implementation.*30-45.*15-25/is);
+  assert.match(description, /scope or risk materially differs/i);
   assert.match(description, /TaskOutput.*continue.*SendMessage.*TaskStop/is);
+  assert.doesNotMatch(description, /normally 30|normally 20|30\/20/);
 });

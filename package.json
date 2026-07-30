@@ -1,6 +1,6 @@
 {
   "name": "pi-claude-subagents",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Claude-inspired subagent orchestration implemented strictly with Pi-native sessions, tools, resources, and lifecycle semantics",
   "type": "module",
   "license": "MIT",

@@ -672,13 +672,13 @@ export function createNestedAgentAdapter(options: NestedAgentAdapterOptions): To
     isolation: Type.Optional(Type.Union([Type.Literal("none"), Type.Literal("worktree")])),
     cwd: Type.Optional(Type.String()),
     name: Type.Optional(Type.String()),
-    warning_turns: Type.Integer({ minimum: 1, description: `Required first supervision checkpoint; normally ${options.config.warningTurns}.` }),
-    warning_interval_turns: Type.Integer({ minimum: 1, description: `Required recurring checkpoint interval; normally ${options.config.warningIntervalTurns}.` }),
+    warning_turns: Type.Integer({ minimum: 1, description: "Required first checkpoint for this nested task. Typical ranges: 8-12 for narrow/high-risk work, 15-25 for routine investigation, 25-35 for broad research, 30-45 for multi-file implementation, and 10-15 for external/deployment work." }),
+    warning_interval_turns: Type.Integer({ minimum: 1, description: "Required reassessment interval for this nested task. Typical ranges: 5-8 for narrow/high-risk work, 8-12 for routine investigation, 12-20 for broad research, 15-25 for multi-file implementation, and 5-10 for external/deployment work." }),
   });
   return defineTool({
     name: "Agent",
     label: "Agent",
-    description: `Launch a nested named agent for a genuinely independent subtask or better-matched specialist, then synthesize its result into this worker's handoff. Named children start Fresh and require a complete brief. Do not delegate understanding, duplicate work, poll background tasks, or request a nested fork. Nesting is bounded at depth ${options.config.maxAgentDepth}; all children share the root concurrency quota.`,
+    description: `Launch a nested named agent for a genuinely independent subtask or better-matched specialist, then synthesize its result into this worker's handoff. Named children start Fresh and require a complete brief. Choose warning_turns and warning_interval_turns from this nested task's scope and risk rather than copying one universal pair. Typical first/interval ranges: narrow or high-risk 8-12/5-8; routine investigation 15-25/8-12; broad research 25-35/12-20; multi-file implementation 30-45/15-25; external or deployment work 10-15/5-10. Do not delegate understanding, duplicate work, poll background tasks, or request a nested fork. Nesting is bounded at depth ${options.config.maxAgentDepth}; all children share the root concurrency quota.`,
     parameters: paramsSchema,
     async execute(_id, params, signal, onUpdate) {
       const nextDepth = options.parentTask.depth ?? 1;

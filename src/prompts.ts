@@ -149,7 +149,16 @@ Never delegate understanding. Do not write "based on your findings, implement th
 
 ## Progress supervision
 
-The root Agent call always supplies explicit positive warning_turns and warning_interval_turns supervision values (normally the runtime defaults ${config.warningTurns} and ${config.warningIntervalTurns}). In a tasks array, child entries inherit those top-level values unless a specific child deliberately overrides them. Long-running children emit progress-warning checkpoints to the root parent at the supplied first turn and interval. A progress warning is a supervision checkpoint, not a failure: inspect once with TaskOutput, then deliberately continue, steer via SendMessage, or stop via TaskStop based on evidence. Foreground launches release back as a supervised running task on the first warning while the child keeps working; subsequent warnings arrive as follow-up messages. Hard budgets remain available only as explicit unattended policy on custom agent frontmatter or runtime config, not as ordinary invocation arguments.
+The root Agent call chooses explicit positive warning_turns and warning_interval_turns for the actual assignment. These values express when parent supervision becomes useful, not how long the child is allowed to run.
+
+Choose the schedule from expected scope, uncertainty, drift risk, tool cost, external waiting, and visibility of intermediate progress:
+- narrow lookup, fixed-file inspection, or high stall/drift risk: first review around 8-12 turns, then every 5-8;
+- routine code investigation with a reasonably clear path: first review around 15-25 turns, then every 8-12;
+- broad cross-module research: first review around 25-35 turns, then every 12-20;
+- multi-file implementation and validation with visible progress: first review around 30-45 turns, then every 15-25;
+- deployment, network, external commands, repeated retries, or expensive actions: prefer an earlier 10-15 turn review and a 5-10 turn interval.
+
+Choose deliberately within or outside these ranges when the assignment warrants it; do not mechanically reuse one pair across unrelated tasks. In a tasks array, child entries inherit the top-level schedule unless a child's scope or risk materially differs. Long-running children emit progress-warning checkpoints to the root parent at the supplied first turn and interval. A progress warning is a supervision checkpoint, not a failure: inspect once with TaskOutput, then deliberately continue, steer via SendMessage, or stop via TaskStop based on evidence. Foreground launches release back as a supervised running task on the first warning while the child keeps working; subsequent warnings arrive as follow-up messages. Hard budgets remain available only as explicit unattended policy on custom agent frontmatter or runtime config, not as ordinary invocation arguments.
 
 ## Continue or start Fresh
 
@@ -184,7 +193,10 @@ Usage:
 - omit model to use the selected agent's configured model; use model only for a deliberate, known Pi model override;
 - description is a 3-5 word summary;
 - a tasks array launches up to ${config.maxTasksPerLaunch} independent tasks together; use one Agent call for parallel work;
-- every root call explicitly supplies positive warning_turns and warning_interval_turns (normally ${config.warningTurns}/${config.warningIntervalTurns}); tasks-array children inherit the top-level values unless deliberately overridden;
+- every root call chooses positive warning_turns and warning_interval_turns for that assignment rather than copying a universal pair;
+- choose earlier/more frequent review for narrow, uncertain, drift-prone, externally blocked, repetitive, or expensive work, and later/less frequent review for broad implementation with visible progress;
+- practical ranges: narrow/high-risk 8-12 then 5-8; routine investigation 15-25 then 8-12; broad research 25-35 then 12-20; multi-file implementation 30-45 then 15-25; external/deployment work 10-15 then 5-10;
+- tasks-array children inherit the top-level schedule unless a child's scope or risk materially differs;
 - progress warnings are supervision checkpoints: inspect once with TaskOutput, then continue, SendMessage, or TaskStop based on evidence;
 - interactive launches run in the background by default; completion is automatic, so do not poll, peek, duplicate, or predict a running agent's result;
 - after a background launch, do only non-overlapping work or end the turn;

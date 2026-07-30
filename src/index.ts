@@ -42,8 +42,8 @@ export const TaskSpecSchema = Type.Object({
   isolation: Type.Optional(StringEnum(["none", "worktree"] as const, { description: "Optional task isolation. Use none unless worktree isolation is explicitly required." })),
   cwd: Type.Optional(Type.String({ description: "Working directory; defaults to parent cwd" })),
   name: Type.Optional(Type.String({ description: "Optional addressable task name" })),
-  warning_turns: Type.Optional(Type.Integer({ minimum: 1, description: "Optional per-task override for the first supervision checkpoint; inherits the required top-level warning_turns." })),
-  warning_interval_turns: Type.Optional(Type.Integer({ minimum: 1, description: "Optional per-task override for recurring supervision checkpoints; inherits the required top-level warning_interval_turns." })),
+  warning_turns: Type.Optional(Type.Integer({ minimum: 1, description: "Optional per-task override. Choose the earliest turn where this child would benefit from parent review; otherwise inherit the top-level task-specific checkpoint." })),
+  warning_interval_turns: Type.Optional(Type.Integer({ minimum: 1, description: "Optional per-task override. Choose how often this child should be reassessed after its first warning; otherwise inherit the top-level task-specific interval." })),
 });
 
 export const AgentParams = Type.Object({
@@ -56,8 +56,8 @@ export const AgentParams = Type.Object({
   isolation: Type.Optional(StringEnum(["none", "worktree"] as const, { description: "Optional task isolation. Use none unless worktree isolation is explicitly required." })),
   cwd: Type.Optional(Type.String()),
   name: Type.Optional(Type.String()),
-  warning_turns: Type.Integer({ minimum: 1, description: "Required first progress-supervision checkpoint. Use the runtime policy default (normally 30) unless a deliberate task policy specifies another value." }),
-  warning_interval_turns: Type.Integer({ minimum: 1, description: "Required interval for later progress-supervision checkpoints. Use the runtime policy default (normally 20) unless a deliberate task policy specifies another value." }),
+  warning_turns: Type.Integer({ minimum: 1, description: "Required first supervision checkpoint, chosen for this task. Use 8-12 for narrow or high-stall-risk work, 15-25 for routine investigation, and 30-45 for broad implementation or validation with visible progress." }),
+  warning_interval_turns: Type.Integer({ minimum: 1, description: "Required reassessment interval, chosen for this task. Use 5-10 when drift, repetition, external waits, or expensive actions need close review; 10-15 for routine work; 15-25 for productive long-running implementation." }),
   tasks: Type.Optional(Type.Array(TaskSpecSchema)),
 });
 
@@ -447,7 +447,7 @@ export default function register(pi: ExtensionAPI): void {
       "Delegate implementation needing more than a couple of edits, isolation, broad validation, or substantial intermediate tool output unless it is tightly scoped and direct execution is clearly cheaper.",
       "Named agents start Fresh. Explain the goal and why, known evidence and ruled-out paths, exact files/errors, scope, success criteria, validation, and expected response. Never delegate understanding: synthesize research into concrete implementation instructions.",
       "In interactive Pi, Agent launches in the background by default. Do not poll, peek, duplicate, or predict the result. Continue only non-overlapping work, or briefly state what is running and end the turn.",
-      "Use subagent_type: fork only for root-session work that needs the persisted conversation and decisions. Every root call explicitly supplies positive warning_turns and warning_interval_turns (normally the runtime defaults). Tasks-array children inherit the top-level values unless deliberately overridden. Progress warnings are supervision checkpoints: inspect once with TaskOutput, then continue, SendMessage, or TaskStop based on evidence.",
+      "Use subagent_type: fork only for root-session work that needs the persisted conversation and decisions. Every root call chooses positive warning_turns and warning_interval_turns for the actual assignment: earlier and more frequent review for narrow, drift-prone, externally blocked, or expensive work; later and less frequent review for broad implementation with visible progress. Tasks-array children inherit the top-level policy unless their risk differs materially. Progress warnings are supervision checkpoints: inspect once with TaskOutput, then continue, SendMessage, or TaskStop based on evidence.",
     ],
     description: buildAgentToolDescription(currentAgents, currentConfig),
     parameters: AgentParams,

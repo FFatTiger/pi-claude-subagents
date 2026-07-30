@@ -203,17 +203,20 @@ node -e "setTimeout(() => console.log('LONG_TASK_FINISHED'), 60000)"
 - 已有部分输出被保留；
 - 配额在停止后释放。
 
-## 阶段 8：公开参数移除、默认监督与 thinking 诊断
+## 阶段 8：公开参数移除、任务特定监督与 thinking 诊断
 
-检查 Agent 工具的单任务和 `tasks` 子项 schema，确认不再暴露 `max_turns`、`max_tool_calls`、`timeout_ms`，同时根调用必须显式填写 `warning_turns: 30` 与 `warning_interval_turns: 20`；批量子项可以覆盖，否则继承顶层值。随后启动一个普通 `general-purpose` 前台任务，thinking 显式设为 `high`，要求它完成三轮不同的读取/搜索后汇报。
+检查 Agent 工具的单任务和 `tasks` 子项 schema，确认不再暴露 `max_turns`、`max_tool_calls`、`timeout_ms`，同时根调用必须显式填写两个正整数 warning 参数。分别设计窄范围查询、常规调查、跨模块研究和多文件实现任务，确认调用方会根据范围、风险、工具成本、外部等待和中间进度可见性选择不同的 `warning_turns` / `warning_interval_turns`，而不是机械复用同一组值。批量子项可以覆盖，否则继承顶层值。随后启动一个普通 `general-purpose` 前台任务，thinking 显式设为 `high`，要求它完成三轮不同的读取/搜索后汇报。
 
 完成后读取对应 `task.json`。
 
 验收点：
 
 - 公开 Agent 调用没有三项硬预算参数，但根调用必须显式包含两个正整数 warning 参数；
-- tasks-array 子项不重复填写时继承顶层 warning 值，显式覆盖时使用子项值；
-- `warningTurns` 为 30，`warningIntervalTurns` 为 20，`nextWarningTurn` 为 30；
+- 模型可见的 schema、工具说明和父提示词不把内部 30/20 兜底写成常规推荐值；
+- 窄范围或高卡死风险任务选择更早、更频繁的监督，广泛且进度清晰的实现任务选择更晚、更稀疏的监督；
+- 至少三种不同任务的真实调用 JSON 使用了不同的合理 warning 组合；
+- tasks-array 子项不重复填写时继承顶层 warning 值，风险明显不同时显式覆盖；
+- `task.json` 中的 `warningTurns`、`warningIntervalTurns` 和 `nextWarningTurn` 与调用所选值一致；
 - `maxTurns`、`maxToolCalls`、`timeoutMs` 没有被默认写成旧的 80/120/30 分钟；
 - requested thinking 为 high；
 - effective thinking 为 high，或存在明确的 clamp reason；
