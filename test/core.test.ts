@@ -84,6 +84,8 @@ maxToolCalls: 40
 softToolCalls: 30
 toolBudgetBlock: read, grep, find, ls
 timeoutMs: 900000
+warningTurns: 18
+warningIntervalTurns: 9
 ---
 Scout prompt
 `);
@@ -94,6 +96,8 @@ Scout prompt
   assert.equal(agent?.softToolCalls, 30);
   assert.deepEqual(agent?.toolBudgetBlock, ["read", "grep", "find", "ls"]);
   assert.equal(agent?.timeoutMs, 900000);
+  assert.equal(agent?.warningTurns, 18);
+  assert.equal(agent?.warningIntervalTurns, 9);
 });
 
 test("runtime defaults leave budgets and cleanup unset", () => {
@@ -104,6 +108,8 @@ test("runtime defaults leave budgets and cleanup unset", () => {
   assert.equal(DEFAULT_CONFIG.defaultMaxToolCalls, undefined);
   assert.equal(DEFAULT_CONFIG.defaultSoftToolCalls, undefined);
   assert.deepEqual(DEFAULT_CONFIG.defaultToolBudgetBlock, ["read", "grep", "find", "ls"]);
+  assert.equal(DEFAULT_CONFIG.warningTurns, 30);
+  assert.equal(DEFAULT_CONFIG.warningIntervalTurns, 20);
   assert.equal(DEFAULT_CONFIG.maxOutputBytes, 200 * 1024);
   assert.equal(DEFAULT_CONFIG.maxOutputLines, 5000);
   assert.equal(DEFAULT_CONFIG.cleanupPeriodDays, undefined);
@@ -112,6 +118,22 @@ test("runtime defaults leave budgets and cleanup unset", () => {
     assert.equal(agent.maxToolCalls, undefined, `${agent.name} should inherit the unlimited default`);
     assert.equal(agent.timeoutMs, undefined, `${agent.name} should inherit the no-timeout default`);
   }
+});
+
+test("mandatory warning config falls back instead of disabling supervision", () => {
+  const configured = applyConfig(DEFAULT_CONFIG, {
+    warningTurns: 45,
+    warningIntervalTurns: 15,
+  });
+  assert.equal(configured.warningTurns, 45);
+  assert.equal(configured.warningIntervalTurns, 15);
+
+  const invalid = applyConfig(configured, {
+    warningTurns: null,
+    warningIntervalTurns: 0,
+  });
+  assert.equal(invalid.warningTurns, 45);
+  assert.equal(invalid.warningIntervalTurns, 15);
 });
 
 test("applies settings model overrides and reports stale role names", () => {

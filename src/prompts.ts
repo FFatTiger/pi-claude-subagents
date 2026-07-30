@@ -14,9 +14,6 @@ export interface AgentRequestInput {
   isolation?: "none" | "worktree";
   cwd?: string;
   name?: string;
-  timeout_ms?: number;
-  max_turns?: number;
-  max_tool_calls?: number;
 }
 
 export interface DispatchDecision {
@@ -150,9 +147,9 @@ A named agent starts with no conversation history. Brief it like a capable colle
 
 Never delegate understanding. Do not write "based on your findings, implement the fix" or "based on the research, change it." Read the findings first: the parent converts research into concrete follow-up instructions that prove understanding with specific paths, behavior, and required changes.
 
-## Runtime budgets
+## Progress supervision
 
-Normal tasks inherit the selected role and runtime defaults, which leave room for ordinary investigation, implementation, and validation. Use an explicit timeout, turn, or tool budget only for an intentionally bounded read-only probe or inexpensive check. When the assignment is mutation-capable, give a narrow deliverable and enough room for implementation and validation. A wrap-up notice means the child should prepare a concise checkpoint or final report from evidence already collected.
+Ordinary Agent calls inherit role and runtime policy; do not estimate or set turn/tool/timeout budgets on the call. Long-running children emit automatic progress-warning checkpoints to the root parent (defaults: first at turn 30, then every 20 turns). A progress warning is a supervision checkpoint, not a failure: inspect once with TaskOutput, then deliberately continue, steer via SendMessage, or stop via TaskStop based on evidence. Foreground launches release back as a supervised running task on the first warning while the child keeps working; subsequent warnings arrive as follow-up messages. Hard budgets remain available only as explicit unattended policy on custom agent frontmatter or runtime config, not as ordinary invocation arguments.
 
 ## Continue or start Fresh
 
@@ -187,10 +184,11 @@ Usage:
 - omit model to use the selected agent's configured model; use model only for a deliberate, known Pi model override;
 - description is a 3-5 word summary;
 - a tasks array launches up to ${config.maxTasksPerLaunch} independent tasks together; use one Agent call for parallel work;
-- normal tasks inherit role and runtime defaults; use timeout/turn/tool budgets only for a bounded read-only probe or inexpensive check, and leave implementation room for validation;
+- ordinary calls inherit role and runtime policy; do not set turn/tool/timeout budgets on the call;
+- progress warnings are supervision checkpoints: inspect once with TaskOutput, then continue, SendMessage, or TaskStop based on evidence;
 - interactive launches run in the background by default; completion is automatic, so do not poll, peek, duplicate, or predict a running agent's result;
 - after a background launch, do only non-overlapping work or end the turn;
-- set run_in_background: false when results are required before the call returns;
+- set run_in_background: false when results are required before the call returns; the first progress warning releases that wait while the child keeps running;
 - use SendMessage to continue a live or persisted resumable agent;
 - set isolation: "worktree" for an isolated Git working copy when parallel writers are necessary;
 - the child returns one handoff to the caller; synthesize it for the user rather than forwarding raw output.

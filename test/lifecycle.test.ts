@@ -1,23 +1,91 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
+  advanceWarningCheckpoint,
   createChildLifecycleController,
+  resolveWarningSchedule,
   statusForTermination,
   type TerminationKind,
 } from "../src/lifecycle.ts";
 
-test("unconfigured lifecycle has no turn or tool budget", () => {
+test("mandatory warning schedule falls back to safe positive defaults", () => {
+  assert.deepEqual(resolveWarningSchedule({ warningTurns: null, warningIntervalTurns: 0 }), {
+    warningTurns: 30,
+    warningIntervalTurns: 20,
+  });
+  assert.deepEqual(resolveWarningSchedule({ warningTurns: 12, warningIntervalTurns: 7 }), {
+    warningTurns: 12,
+    warningIntervalTurns: 7,
+  });
+  assert.equal(advanceWarningCheckpoint(70, 30, 20), 90);
+});
+
+test("progress warnings recur without stopping or restricting work", () => {
+  const lifecycle = createChildLifecycleController({ warningTurns: 3, warningIntervalTurns: 2 });
+  const warnings = [];
+  for (let turn = 1; turn <= 7; turn++) {
+    lifecycle.onTurnStart();
+    assert.equal(lifecycle.admitTool("read").allowed, true);
+    const completion = lifecycle.onTurnEnd({ messageHasText: false, wouldContinue: true });
+    if (completion.progressWarning) warnings.push(completion.progressWarning);
+    assert.equal(completion.queueFinalHandoff, false);
+    assert.equal(completion.stopAfterTurn, false);
+  }
+  assert.deepEqual(warnings.map(item => [item.turn, item.nextWarningTurn, item.warningCount]), [
+    [3, 5, 1],
+    [5, 7, 2],
+    [7, 9, 3],
+  ]);
+  assert.equal(lifecycle.snapshot.phase, "working");
+});
+
+test("completion at a warning checkpoint does not emit a warning", () => {
+  const lifecycle = createChildLifecycleController({ warningTurns: 2, warningIntervalTurns: 3 });
+  lifecycle.onTurnStart();
+  lifecycle.onTurnEnd({ messageHasText: false, wouldContinue: true });
+  lifecycle.onTurnStart();
+  const completion = lifecycle.onTurnEnd({ messageHasText: true, wouldContinue: false });
+  assert.equal(completion.progressWarning, undefined);
+  assert.equal(lifecycle.snapshot.nextWarningTurn, 2);
+});
+
+test("resume skips persisted checkpoints and continues the recurring schedule", () => {
+  const lifecycle = createChildLifecycleController({
+    warningTurns: 30,
+    warningIntervalTurns: 20,
+    initialTurns: 50,
+    nextWarningTurn: 50,
+    warningCount: 2,
+  });
+  assert.equal(lifecycle.snapshot.nextWarningTurn, 70);
+  for (let i = 0; i < 20; i++) {
+    lifecycle.onTurnStart();
+    const completion = lifecycle.onTurnEnd({ messageHasText: false, wouldContinue: true });
+    if (i < 19) assert.equal(completion.progressWarning, undefined);
+    else assert.deepEqual(completion.progressWarning, {
+      turn: 70,
+      nextWarningTurn: 90,
+      warningCount: 3,
+      warningTurns: 30,
+      warningIntervalTurns: 20,
+    });
+  }
+});
+
+test("unconfigured lifecycle has no turn or tool budget and keeps mandatory supervision", () => {
   const lifecycle = createChildLifecycleController({});
+  const warningTurns: number[] = [];
 
   for (let i = 0; i < 100; i++) {
     lifecycle.onTurnStart();
     assert.equal(lifecycle.admitTool("read").allowed, true);
-    assert.deepEqual(lifecycle.onTurnEnd({ messageHasText: false, wouldContinue: true }), {
-      queueFinalHandoff: false,
-      stopAfterTurn: false,
-    });
+    const completion = lifecycle.onTurnEnd({ messageHasText: false, wouldContinue: true });
+    assert.equal(completion.queueFinalHandoff, false);
+    assert.equal(completion.stopAfterTurn, false);
+    if (completion.progressWarning) warningTurns.push(completion.progressWarning.turn);
   }
 
+  assert.deepEqual(warningTurns, [30, 50, 70, 90]);
   assert.equal(lifecycle.snapshot.usage.turns, 100);
   assert.equal(lifecycle.snapshot.usage.toolCallsExecuted, 100);
   assert.equal(lifecycle.snapshot.toolBudgetExhausted, false);

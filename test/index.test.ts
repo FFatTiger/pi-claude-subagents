@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { createCompletionDeduper, formatTaskDiagnostic, taskNotification } from "../src/index.ts";
+import register, { AgentParams, TaskSpecSchema, createCompletionDeduper, formatTaskDiagnostic, progressWarningNotification, taskNotification } from "../src/index.ts";
 import type { TaskRecord } from "../src/tasks.ts";
 
 function partialTask(): TaskRecord {
@@ -42,6 +42,39 @@ function partialTask(): TaskRecord {
     },
   };
 }
+
+test("public Agent schemas omit invocation hard budgets", () => {
+  const topLevel = AgentParams as unknown as { properties: Record<string, unknown> };
+  const taskLevel = TaskSpecSchema as unknown as { properties: Record<string, unknown> };
+  for (const schema of [topLevel, taskLevel]) {
+    assert.equal("max_turns" in schema.properties, false);
+    assert.equal("max_tool_calls" in schema.properties, false);
+    assert.equal("timeout_ms" in schema.properties, false);
+  }
+  assert.equal(typeof register, "function");
+});
+
+test("progress warning notification is structured and actionable", () => {
+  const task = partialTask();
+  task.status = "running";
+  task.preview = "Tracing refresh callers";
+  task.warningTurns = 30;
+  task.warningIntervalTurns = 20;
+  task.nextWarningTurn = 50;
+  const notification = progressWarningNotification(task, {
+    turn: 30,
+    nextWarningTurn: 50,
+    warningCount: 1,
+    warningTurns: 30,
+    warningIntervalTurns: 20,
+  });
+  assert.match(notification, /<progress-warning>/);
+  assert.match(notification, /turn="30" next="50"/);
+  assert.match(notification, /TaskOutput/);
+  assert.match(notification, /SendMessage/);
+  assert.match(notification, /TaskStop/);
+});
+
 
 test("completion deduper suppresses duplicate callback for one invocation but permits resume", () => {
   const dedupe = createCompletionDeduper();

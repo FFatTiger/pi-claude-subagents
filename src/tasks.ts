@@ -54,6 +54,15 @@ export interface TaskRecord {
   softToolCalls?: number;
   toolBudgetBlock?: string[] | "*";
   timeoutMs?: number;
+  /** Effective first progress-warning checkpoint (absolute turns). Always set on new tasks. */
+  warningTurns?: number;
+  /** Effective interval between progress-warning checkpoints. Always set on new tasks. */
+  warningIntervalTurns?: number;
+  /** Next absolute turn that should emit a progress warning. */
+  nextWarningTurn?: number;
+  warningCount?: number;
+  lastWarningAt?: string;
+  lastWarningTurn?: number;
   forkSystemPrompt?: string;
   sessionFile?: string;
   outputFile: string;
@@ -77,6 +86,8 @@ export interface LiveTask {
   promise: Promise<TaskRecord>;
   send: (message: string) => Promise<void>;
   stop: (kind: "manual_stop" | "parent_shutdown") => Promise<void>;
+  /** Resolves once the first progress warning has released a foreground wait (if any). */
+  foregroundReleased?: Promise<void>;
 }
 
 export function taskRoot(parentSessionId: string): string {
@@ -108,6 +119,10 @@ function buildTaskRecord(options: {
   softToolCalls?: number;
   toolBudgetBlock?: string[] | "*";
   timeoutMs?: number;
+  warningTurns?: number;
+  warningIntervalTurns?: number;
+  nextWarningTurn?: number;
+  warningCount?: number;
   forkSystemPrompt?: string;
   name?: string;
 }): TaskRecord {
@@ -138,6 +153,10 @@ function buildTaskRecord(options: {
     softToolCalls: options.softToolCalls,
     toolBudgetBlock: options.toolBudgetBlock,
     timeoutMs: options.timeoutMs,
+    warningTurns: options.warningTurns,
+    warningIntervalTurns: options.warningIntervalTurns,
+    nextWarningTurn: options.nextWarningTurn ?? options.warningTurns,
+    warningCount: options.warningCount ?? 0,
     forkSystemPrompt: options.forkSystemPrompt,
     outputFile: path.join(path.dirname(options.taskFile), "output.md"),
     taskFile: options.taskFile,
@@ -185,6 +204,10 @@ export async function createTaskRecord(options: {
   softToolCalls?: number;
   toolBudgetBlock?: string[] | "*";
   timeoutMs?: number;
+  warningTurns?: number;
+  warningIntervalTurns?: number;
+  nextWarningTurn?: number;
+  warningCount?: number;
   forkSystemPrompt?: string;
   name?: string;
 }): Promise<TaskRecord> {

@@ -22,6 +22,10 @@ export interface PiSubagentsConfig {
   defaultMaxToolCalls?: number;
   defaultSoftToolCalls?: number;
   defaultToolBudgetBlock: string[] | "*";
+  /** First progress-warning checkpoint (absolute turns). Always a positive integer. */
+  warningTurns: number;
+  /** Interval between subsequent progress-warning checkpoints. Always a positive integer. */
+  warningIntervalTurns: number;
   maxOutputBytes: number;
   maxOutputLines: number;
   /** @deprecated Prefer maxOutputBytes. Accepted as a fallback when loading config. */
@@ -38,6 +42,9 @@ export interface PiSubagentsConfig {
   cleanupPeriodDays?: number;
 }
 
+export const DEFAULT_WARNING_TURNS = 30;
+export const DEFAULT_WARNING_INTERVAL_TURNS = 20;
+
 export const DEFAULT_CONFIG: PiSubagentsConfig = {
   maxConcurrentTasks: 20,
   defaultTimeoutMs: undefined,
@@ -46,6 +53,8 @@ export const DEFAULT_CONFIG: PiSubagentsConfig = {
   defaultMaxToolCalls: undefined,
   defaultSoftToolCalls: undefined,
   defaultToolBudgetBlock: ["read", "grep", "find", "ls"],
+  warningTurns: DEFAULT_WARNING_TURNS,
+  warningIntervalTurns: DEFAULT_WARNING_INTERVAL_TURNS,
   maxOutputBytes: 200 * 1024,
   maxOutputLines: 5_000,
   maxTasksPerLaunch: 8,
@@ -144,6 +153,13 @@ function numberValue(value: unknown, fallback: number, min: number, max?: number
   return max === undefined ? normalized : Math.min(normalized, max);
 }
 
+/** Mandatory positive integer; null/0/invalid fall back rather than disabling the feature. */
+function positiveNumberValue(value: unknown, fallback: number): number {
+  if (value === null || value === undefined || value === "") return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 1) return fallback;
+  return Math.floor(value);
+}
+
 function optionalNumberValue(value: unknown, fallback: number | undefined, min: number, max?: number): number | undefined {
   // Explicit JSON null unsets an inherited optional default.
   if (value === null) return undefined;
@@ -187,6 +203,8 @@ export function applyConfig(base: PiSubagentsConfig, raw: Record<string, unknown
     defaultMaxToolCalls: optionalNumberValue(raw.defaultMaxToolCalls, base.defaultMaxToolCalls, 1),
     defaultSoftToolCalls: optionalNumberValue(raw.defaultSoftToolCalls, base.defaultSoftToolCalls, 1),
     defaultToolBudgetBlock: parseToolBudgetBlock(raw.defaultToolBudgetBlock, base.defaultToolBudgetBlock),
+    warningTurns: positiveNumberValue(raw.warningTurns, base.warningTurns),
+    warningIntervalTurns: positiveNumberValue(raw.warningIntervalTurns, base.warningIntervalTurns),
     maxOutputBytes: maxOutputBytesFallback,
     maxOutputLines: numberValue(raw.maxOutputLines, base.maxOutputLines, 1),
     maxTasksPerLaunch: numberValue(raw.maxTasksPerLaunch, base.maxTasksPerLaunch, 1),

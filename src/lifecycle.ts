@@ -28,9 +28,18 @@ export interface ToolAdmission {
   queueWrapUp?: boolean;
 }
 
+export interface ProgressWarning {
+  turn: number;
+  nextWarningTurn: number;
+  warningCount: number;
+  warningTurns: number;
+  warningIntervalTurns: number;
+}
+
 export interface TurnCompletion {
   queueFinalHandoff: boolean;
   stopAfterTurn: boolean;
+  progressWarning?: ProgressWarning;
 }
 
 export interface LifecycleSnapshot {
@@ -42,6 +51,10 @@ export interface LifecycleSnapshot {
   finalHandoffTurnStarted: boolean;
   toolBudgetExhausted: boolean;
   turnBudgetExhausted: boolean;
+  nextWarningTurn: number;
+  warningCount: number;
+  warningTurns: number;
+  warningIntervalTurns: number;
 }
 
 export type ToolPolicyBlock = { kind: "readonly" | "shell_policy"; reason: string };
@@ -81,12 +94,56 @@ function isInteger(value: number | undefined): value is number {
   return value !== undefined && Number.isInteger(value);
 }
 
+/** Resolve mandatory positive warning schedule values. Invalid/null/0 fall back safely. */
+export function resolveWarningSchedule(options: {
+  warningTurns?: number | null;
+  warningIntervalTurns?: number | null;
+  fallbackTurns?: number;
+  fallbackInterval?: number;
+}): { warningTurns: number; warningIntervalTurns: number } {
+  const fallbackTurns = options.fallbackTurns !== undefined && Number.isInteger(options.fallbackTurns) && options.fallbackTurns >= 1
+    ? options.fallbackTurns
+    : 30;
+  const fallbackInterval = options.fallbackInterval !== undefined && Number.isInteger(options.fallbackInterval) && options.fallbackInterval >= 1
+    ? options.fallbackInterval
+    : 20;
+  const warningTurns = options.warningTurns !== undefined && options.warningTurns !== null
+    && Number.isInteger(options.warningTurns) && options.warningTurns >= 1
+    ? options.warningTurns
+    : fallbackTurns;
+  const warningIntervalTurns = options.warningIntervalTurns !== undefined && options.warningIntervalTurns !== null
+    && Number.isInteger(options.warningIntervalTurns) && options.warningIntervalTurns >= 1
+    ? options.warningIntervalTurns
+    : fallbackInterval;
+  return { warningTurns, warningIntervalTurns };
+}
+
+/** Advance nextWarningTurn strictly past absoluteTurns so the same checkpoint cannot fire twice. */
+export function advanceWarningCheckpoint(
+  absoluteTurns: number,
+  nextWarningTurn: number,
+  warningIntervalTurns: number,
+): number {
+  let next = nextWarningTurn;
+  const interval = Math.max(1, warningIntervalTurns);
+  while (next <= absoluteTurns) next += interval;
+  return next;
+}
+
 export function createChildLifecycleController(options: {
   maxTurns?: number;
   graceTurns?: number;
   maxToolCalls?: number;
   softToolCalls?: number;
   toolBudgetBlock?: string[] | "*";
+  /** Absolute turn number of the first warning checkpoint (defaults to warningTurns). */
+  warningTurns?: number;
+  warningIntervalTurns?: number;
+  /** Cumulative turns already completed before this invocation (resume baseline). */
+  initialTurns?: number;
+  /** Persisted next checkpoint; defaults to warningTurns when unset/invalid. */
+  nextWarningTurn?: number;
+  warningCount?: number;
 } = {}): ChildLifecycleController {
   if (options.maxTurns !== undefined && (!Number.isInteger(options.maxTurns) || options.maxTurns < 1)) {
     throw new Error("maxTurns must be an integer >= 1");
@@ -115,6 +172,29 @@ export function createChildLifecycleController(options: {
   const softToolCalls = options.softToolCalls;
   const toolBudgetBlock = options.toolBudgetBlock ?? ["read", "grep", "find", "ls"];
   const hardTurnLimit = maxTurns === undefined || graceTurns === undefined ? undefined : maxTurns + graceTurns;
+  const schedule = resolveWarningSchedule({
+    warningTurns: options.warningTurns,
+    warningIntervalTurns: options.warningIntervalTurns,
+  });
+  const warningTurns = schedule.warningTurns;
+  const warningIntervalTurns = schedule.warningIntervalTurns;
+  const initialTurns = options.initialTurns !== undefined && Number.isInteger(options.initialTurns) && options.initialTurns >= 0
+    ? options.initialTurns
+    : 0;
+  let nextWarningTurn = options.nextWarningTurn !== undefined
+    && Number.isInteger(options.nextWarningTurn)
+    && options.nextWarningTurn >= 1
+    ? options.nextWarningTurn
+    : warningTurns;
+  // If resume starts past a stale checkpoint, skip it without firing.
+  if (initialTurns >= nextWarningTurn) {
+    nextWarningTurn = advanceWarningCheckpoint(initialTurns, nextWarningTurn, warningIntervalTurns);
+  }
+  let warningCount = options.warningCount !== undefined
+    && Number.isInteger(options.warningCount)
+    && options.warningCount >= 0
+    ? options.warningCount
+    : 0;
 
   let phase: LifecyclePhase = "starting";
   const usage: LifecycleUsage = {
@@ -142,6 +222,10 @@ export function createChildLifecycleController(options: {
     finalHandoffTurnStarted,
     toolBudgetExhausted,
     turnBudgetExhausted,
+    nextWarningTurn,
+    warningCount,
+    warningTurns,
+    warningIntervalTurns,
   });
 
   const finalize = (kind: TerminationKind): LifecycleSnapshot => {
@@ -232,12 +316,32 @@ export function createChildLifecycleController(options: {
       if (!turnActive) throw new Error("Cannot end a turn before it starts.");
       turnActive = false;
 
+      let progressWarning: ProgressWarning | undefined;
+      const absoluteTurns = initialTurns + usage.turns;
+      // Warn only when the child would continue past a due checkpoint. Finishing exactly at a
+      // checkpoint (wouldContinue=false) is ordinary completion and must not warn.
+      if (wouldContinue && absoluteTurns >= nextWarningTurn) {
+        warningCount++;
+        nextWarningTurn = advanceWarningCheckpoint(absoluteTurns, nextWarningTurn, warningIntervalTurns);
+        progressWarning = {
+          turn: absoluteTurns,
+          nextWarningTurn,
+          warningCount,
+          warningTurns,
+          warningIntervalTurns,
+        };
+      }
+
+      const completion = (queueFinalHandoff: boolean, stopAfterTurn: boolean): TurnCompletion => progressWarning
+        ? { queueFinalHandoff, stopAfterTurn, progressWarning }
+        : { queueFinalHandoff, stopAfterTurn };
+
       if (phase === "final_handoff") {
         if (wouldContinue && hardTurnLimit !== undefined && usage.turns >= hardTurnLimit) {
           turnBudgetExhausted = true;
-          return { queueFinalHandoff: false, stopAfterTurn: true };
+          return completion(false, true);
         }
-        return { queueFinalHandoff: false, stopAfterTurn: false };
+        return completion(false, false);
       }
 
       if (
@@ -247,10 +351,10 @@ export function createChildLifecycleController(options: {
         && !finalHandoffQueued
       ) {
         finalHandoffQueued = true;
-        return { queueFinalHandoff: true, stopAfterTurn: false };
+        return completion(true, false);
       }
 
-      return { queueFinalHandoff: false, stopAfterTurn: false };
+      return completion(false, false);
     },
 
     requestStop(kind) {

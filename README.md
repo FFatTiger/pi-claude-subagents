@@ -16,10 +16,10 @@ Pick one install path:
 
 ```bash
 # npm
-pi install npm:pi-claude-subagents@0.2.4
+pi install npm:pi-claude-subagents@0.3.0
 
 # GitHub release
-pi install git:github.com/FFatTiger/pi-claude-subagents@v0.2.4
+pi install git:github.com/FFatTiger/pi-claude-subagents@v0.3.0
 
 # local checkout
 pi install /absolute/path/to/pi-claude-subagents
@@ -157,6 +157,8 @@ readonly: true
 shellPolicy: verify
 background: true
 isolation: worktree
+warningTurns: 30
+warningIntervalTurns: 20
 maxTurns: 60
 graceTurns: 1
 maxToolCalls: 100
@@ -168,7 +170,7 @@ timeoutMs: 900000
 Review the assigned change and return an evidence-based report.
 ```
 
-Supported frontmatter: `name`, `description`, `tools`, `disallowedTools`, `model`, `thinking`, `skills`, `readonly`, `shellPolicy`, `background`, `context`, `isolation`, `maxTurns`, `graceTurns`, `maxToolCalls`, `softToolCalls`, `toolBudgetBlock`, `timeoutMs`, `oneShot`.
+Supported frontmatter: `name`, `description`, `tools`, `disallowedTools`, `model`, `thinking`, `skills`, `readonly`, `shellPolicy`, `background`, `context`, `isolation`, `warningTurns`, `warningIntervalTurns`, `maxTurns`, `graceTurns`, `maxToolCalls`, `softToolCalls`, `toolBudgetBlock`, `timeoutMs`, `oneShot`. Warning settings control mandatory parent supervision. Hard budgets and timeouts are advanced unattended policies and are not exposed as ordinary `Agent` invocation arguments.
 
 Child coding tools are Pi-native: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, filtered by parent inventory and role definition. Nested roles may also receive the child `Agent` adapter.
 
@@ -202,7 +204,10 @@ Runtime enforcement includes:
 - Exact role tool selection; read-only roles lose edit/write
 - Shell policies: `inspect`, `verify`, `unrestricted`
 - Lifecycle phases: `starting → working → final_handoff → terminal`
-- Optional soft `maxTurns` + grace window (default grace 1)
+- Mandatory recurring progress supervision: first warning at turn 30, then every 20 turns by default
+- Warnings reach the root parent without stopping the child, restricting tools, or changing task status
+- A foreground task is promoted to supervised background execution on its first warning so the parent can inspect, steer, or stop it
+- Optional soft `maxTurns` + grace window for explicit unattended policy (default grace 1)
 - Optional hard `maxToolCalls` that blocks only configured tools (default `read`, `grep`, `find`, `ls`)
 - Explicit termination kinds: `normal`, `turn_budget`, `tool_budget`, `timeout`, `manual_stop`, `parent_shutdown`, `provider_error`, `startup_error`
 - Task statuses: `running`, `completed`, `partial`, `failed`, `stopped`
@@ -240,6 +245,8 @@ Trusted project:
   "defaultMaxToolCalls": null,
   "defaultSoftToolCalls": null,
   "defaultToolBudgetBlock": ["read", "grep", "find", "ls"],
+  "warningTurns": 30,
+  "warningIntervalTurns": 20,
   "maxOutputBytes": 204800,
   "maxOutputLines": 5000,
   "maxTasksPerLaunch": 8,
@@ -255,7 +262,7 @@ Trusted project:
 }
 ```
 
-Defaults leave timeout, turn, tool, and cleanup budgets unset so ordinary work is governed by task scope and Pi session completion. Positive `cleanupPeriodDays` enables age-based retention cleanup. Legacy `maxOutputChars` still maps to `maxOutputBytes`. Bundled roles declare no budgets; custom frontmatter and invocation args can still set them.
+Defaults leave hard timeout, turn, tool, and cleanup budgets unset, while mandatory progress supervision starts at turn 30 and repeats every 20 turns. Invalid, zero, or null warning values fall back to a positive inherited/default value rather than disabling supervision. Positive `cleanupPeriodDays` enables age-based retention cleanup. Legacy `maxOutputChars` still maps to `maxOutputBytes`. Bundled roles declare no hard budgets; custom frontmatter and runtime config can still define advanced unattended policies.
 
 ## Persistence
 

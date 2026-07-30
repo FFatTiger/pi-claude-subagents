@@ -22,8 +22,10 @@ import { agentAllowsNestedAgents, resolveAgentTools, type ToolDescriptor } from 
 import type { PiSubagentsConfig } from "./config.ts";
 import {
   createChildLifecycleController,
+  resolveWarningSchedule,
   type ChildLifecycleController,
   type LifecycleUsage,
+  type ProgressWarning,
 } from "./lifecycle.ts";
 import { buildChildBoundary, resolveTaskIsolation } from "./prompts.ts";
 import {
@@ -319,11 +321,21 @@ export interface LaunchSpec {
   maxToolCalls?: number;
   softToolCalls?: number;
   toolBudgetBlock?: string[] | "*";
+  warningTurns: number;
+  warningIntervalTurns: number;
   toolInventory?: ToolDescriptor[];
   allowNestedAgent?: boolean;
   containmentRoot?: string;
   isolation?: "worktree" | "none";
   name?: string;
+}
+
+export interface ProgressWarningDetails {
+  turn: number;
+  nextWarningTurn: number;
+  warningCount: number;
+  warningTurns: number;
+  warningIntervalTurns: number;
 }
 
 export interface ParentLaunchContext {
@@ -571,7 +583,10 @@ function toolPolicyBlock(agent: AgentDefinition, toolName: string, input: Record
 export function createChildLifecycleExtension(
   agent: AgentDefinition,
   lifecycle: ChildLifecycleController,
-  _options: { maxTurns?: number } = {},
+  options: {
+    maxTurns?: number;
+    onProgressWarning?: (warning: ProgressWarning) => void;
+  } = {},
 ): ExtensionFactory {
   return pi => {
     let finalHandoffSent = false;
@@ -601,6 +616,8 @@ export function createChildLifecycleExtension(
           && event.message.stopReason !== "error"
           && event.message.stopReason !== "aborted"),
       });
+      // Progress warnings never abort, restrict tools, inject wrap-up, or change running status.
+      if (completion.progressWarning) options.onProgressWarning?.(completion.progressWarning);
       if (completion.queueFinalHandoff) enterFinalHandoff();
       if (completion.stopAfterTurn) ctx.abort();
     });
@@ -615,6 +632,7 @@ export interface NestedAgentAdapterOptions {
   parentTask: TaskRecord;
   taskQuota: TaskQuota;
   onComplete: (record: TaskRecord) => void;
+  onProgressWarning?: (record: TaskRecord, details: ProgressWarningDetails) => void;
   onTaskStarted?: (task: LiveTask) => void;
   deliverNestedResult?: (record: TaskRecord) => Promise<void>;
 }
@@ -673,6 +691,12 @@ export function createNestedAgentAdapter(options: NestedAgentAdapterOptions): To
       if (!selected) throw new Error(`Unknown nested agent '${params.subagent_type ?? "general-purpose"}'.`);
       await options.taskQuota.acquireDependency(signal ?? undefined);
       try {
+        const nestedSchedule = resolveWarningSchedule({
+          warningTurns: selected.warningTurns ?? options.config.warningTurns,
+          warningIntervalTurns: selected.warningIntervalTurns ?? options.config.warningIntervalTurns,
+          fallbackTurns: options.config.warningTurns,
+          fallbackInterval: options.config.warningIntervalTurns,
+        });
         const task = await launchTask({
           spec: {
             agent: selected,
@@ -688,6 +712,8 @@ export function createNestedAgentAdapter(options: NestedAgentAdapterOptions): To
             maxToolCalls: selected.maxToolCalls ?? options.config.defaultMaxToolCalls,
             softToolCalls: selected.softToolCalls ?? options.config.defaultSoftToolCalls,
             toolBudgetBlock: selected.toolBudgetBlock ?? options.config.defaultToolBudgetBlock,
+            warningTurns: nestedSchedule.warningTurns,
+            warningIntervalTurns: nestedSchedule.warningIntervalTurns,
             isolation: resolveTaskIsolation(params.isolation as "none" | "worktree" | undefined, selected.isolation),
             name: params.name,
             toolInventory: options.parent.toolInventory,
@@ -711,6 +737,7 @@ export function createNestedAgentAdapter(options: NestedAgentAdapterOptions): To
             options.onComplete(record);
             if (record.background) void options.deliverNestedResult?.(record);
           },
+          onProgressWarning: options.onProgressWarning,
           onUpdate: record => onUpdate?.({ content: [{ type: "text", text: `${record.description}: ${record.preview ?? "running"}` }], details: record }),
         });
         options.onTaskStarted?.(task);
@@ -737,10 +764,12 @@ async function makeChildSession(options: {
   config: PiSubagentsConfig;
   agents?: AgentDefinition[];
   onComplete: (record: TaskRecord) => void;
+  onProgressWarning?: (record: TaskRecord, details: ProgressWarningDetails) => void;
   onTaskStarted?: (task: LiveTask) => void;
   deliverNestedResult?: (record: TaskRecord) => Promise<void>;
   worktree?: WorktreeInfo;
   lifecycle: ChildLifecycleController;
+  onLifecycleProgressWarning?: (warning: ProgressWarning) => void;
 }) {
   const cwd = options.worktree?.cwd ?? options.spec.cwd;
   const containmentRoot = options.worktree?.path ?? options.spec.containmentRoot;
@@ -753,6 +782,7 @@ async function makeChildSession(options: {
   const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: options.parent.projectTrusted });
   const guardFactory = createChildLifecycleExtension(options.spec.agent, options.lifecycle, {
     maxTurns: options.spec.maxTurns,
+    onProgressWarning: options.onLifecycleProgressWarning,
   });
   // Optional budgets are enforced by the lifecycle controller; wrap-up is advisory.
   const requestedTools = resolveTools(options.spec.agent, { inventory: options.spec.toolInventory ?? options.parent.toolInventory, allowNestedAgent: options.spec.allowNestedAgent });
@@ -832,6 +862,7 @@ async function makeChildSession(options: {
       parentTask: options.record,
       taskQuota: options.parent.taskQuota,
       onComplete: options.onComplete,
+      onProgressWarning: options.onProgressWarning,
       onTaskStarted: options.onTaskStarted,
       deliverNestedResult: options.deliverNestedResult,
     })
@@ -869,10 +900,17 @@ export async function launchTask(options: {
   config: PiSubagentsConfig;
   agents?: AgentDefinition[];
   onComplete: (record: TaskRecord) => void;
+  onProgressWarning?: (record: TaskRecord, details: ProgressWarningDetails) => void;
   onTaskStarted?: (task: LiveTask) => void;
   onUpdate?: (record: TaskRecord) => void;
 }): Promise<LiveTask> {
   validateAgentDefinition(options.spec.agent);
+  const schedule = resolveWarningSchedule({
+    warningTurns: options.spec.warningTurns,
+    warningIntervalTurns: options.spec.warningIntervalTurns,
+    fallbackTurns: options.config.warningTurns,
+    fallbackInterval: options.config.warningIntervalTurns,
+  });
   const record = await createUnpersistedTaskRecord({
     parentSessionId: options.parent.parentSessionId,
     rootParentSessionId: options.parent.rootParentSessionId ?? options.parent.parentSessionId,
@@ -895,22 +933,49 @@ export async function launchTask(options: {
     softToolCalls: options.spec.softToolCalls,
     toolBudgetBlock: options.spec.toolBudgetBlock,
     timeoutMs: options.spec.timeoutMs,
+    warningTurns: schedule.warningTurns,
+    warningIntervalTurns: schedule.warningIntervalTurns,
+    nextWarningTurn: schedule.warningTurns,
+    warningCount: 0,
     forkSystemPrompt: options.spec.forked ? options.parent.parentSystemPrompt : undefined,
     name: options.spec.name,
   });
   const abortController = new AbortController();
+  let resolveForegroundReleased!: () => void;
+  const foregroundReleased = new Promise<void>(resolve => {
+    resolveForegroundReleased = resolve;
+  });
+  // Background launches never block the parent Agent tool on foreground wait.
+  if (options.spec.background) resolveForegroundReleased();
   const lifecycle = createChildLifecycleController({
     maxToolCalls: options.spec.maxToolCalls,
     softToolCalls: options.spec.softToolCalls,
     toolBudgetBlock: options.spec.toolBudgetBlock,
     maxTurns: options.spec.maxTurns,
     graceTurns: options.spec.graceTurns,
+    warningTurns: schedule.warningTurns,
+    warningIntervalTurns: schedule.warningIntervalTurns,
   });
   const usageBaseline: LifecycleUsageBaseline = {
     turns: record.usage.turns,
     toolCallsRequested: record.usage.toolCallsRequested,
     toolCallsExecuted: record.usage.toolCallsExecuted,
     toolCallsBlocked: record.usage.toolCallsBlocked,
+  };
+  const handleProgressWarning = (warning: ProgressWarning) => {
+    record.nextWarningTurn = warning.nextWarningTurn;
+    record.warningCount = warning.warningCount;
+    record.lastWarningAt = new Date().toISOString();
+    record.lastWarningTurn = warning.turn;
+    // A foreground invocation cannot be supervised while its parent is blocked inside Agent.
+    // Promote it before notifying/releasing so actual completion follows the background path.
+    if (!record.background) record.background = true;
+    applyLifecycleUsage(record, usageBaseline, lifecycle.snapshot.usage);
+    void persistTask(record).catch(() => {});
+    options.onUpdate?.(record);
+    options.onProgressWarning?.(record, warning);
+    // First warning releases a blocked foreground Agent wait without completing the task.
+    resolveForegroundReleased();
   };
   let stopError: string | undefined;
   let startupComplete = false;
@@ -945,7 +1010,9 @@ export async function launchTask(options: {
         config: options.config,
         agents: options.agents,
         onComplete: options.onComplete,
+        onProgressWarning: options.onProgressWarning,
         onTaskStarted: options.onTaskStarted,
+        onLifecycleProgressWarning: handleProgressWarning,
         deliverNestedResult: async nestedRecord => {
           if (!childSession) return;
           const nestedResult = formatTaskOutputForModel(nestedRecord, {
@@ -1044,6 +1111,8 @@ export async function launchTask(options: {
       if (cleanedResumableWorktree && record.status === "completed") {
         record.worktreeCleaned = true;
       }
+      // Always release any remaining foreground wait so callers cannot hang after terminal.
+      resolveForegroundReleased();
       if (record.status === "failed" && !record.sessionFile) {
         record.completedAt = new Date().toISOString();
         await fs.promises.rm(path.dirname(record.taskFile), { recursive: true, force: true });
@@ -1061,6 +1130,7 @@ export async function launchTask(options: {
     record,
     abortController,
     promise,
+    foregroundReleased,
     send: async message => {
       await childReady;
       if (!childSession) throw new Error("child session failed to start");
@@ -1095,6 +1165,7 @@ export async function resumeCompletedTask(options: {
   parent?: ParentLaunchContext;
   onTaskStarted?: (task: LiveTask) => void;
   onComplete: (record: TaskRecord) => void;
+  onProgressWarning?: (record: TaskRecord, details: ProgressWarningDetails) => void;
 }): Promise<LiveTask> {
   validateAgentDefinition(options.agent);
   const sessionFile = options.record.sessionFile;
@@ -1128,18 +1199,34 @@ export async function resumeCompletedTask(options: {
   const persistedMaxTurns = options.record.maxTurns ?? options.config.defaultMaxTurns;
   const persistedGraceTurns = options.record.graceTurns ?? options.config.defaultGraceTurns;
   const persistedTimeoutMs = options.record.timeoutMs ?? options.config.defaultTimeoutMs;
+  const resumeSchedule = resolveWarningSchedule({
+    warningTurns: options.record.warningTurns ?? options.config.warningTurns,
+    warningIntervalTurns: options.record.warningIntervalTurns ?? options.config.warningIntervalTurns,
+    fallbackTurns: options.config.warningTurns,
+    fallbackInterval: options.config.warningIntervalTurns,
+  });
   options.record.maxToolCalls = persistedMaxToolCalls;
   options.record.softToolCalls = persistedSoftToolCalls;
   options.record.toolBudgetBlock = persistedToolBudgetBlock;
   options.record.maxTurns = persistedMaxTurns;
   options.record.graceTurns = persistedGraceTurns;
   options.record.timeoutMs = persistedTimeoutMs;
+  options.record.warningTurns = resumeSchedule.warningTurns;
+  options.record.warningIntervalTurns = resumeSchedule.warningIntervalTurns;
+  options.record.nextWarningTurn = options.record.nextWarningTurn
+    ?? resumeSchedule.warningTurns;
+  options.record.warningCount = options.record.warningCount ?? 0;
   const lifecycle = createChildLifecycleController({
     maxToolCalls: persistedMaxToolCalls,
     softToolCalls: persistedSoftToolCalls,
     toolBudgetBlock: persistedToolBudgetBlock,
     maxTurns: persistedMaxTurns,
     graceTurns: persistedGraceTurns,
+    warningTurns: resumeSchedule.warningTurns,
+    warningIntervalTurns: resumeSchedule.warningIntervalTurns,
+    initialTurns: options.record.usage.turns,
+    nextWarningTurn: options.record.nextWarningTurn,
+    warningCount: options.record.warningCount,
   });
   const usageBaseline: LifecycleUsageBaseline = {
     turns: options.record.usage.turns,
@@ -1163,6 +1250,15 @@ export async function resumeCompletedTask(options: {
   let unsubscribe: (() => void) | undefined;
   let stopChild: (() => void) | undefined;
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  const handleResumeProgressWarning = (warning: ProgressWarning) => {
+    options.record.nextWarningTurn = warning.nextWarningTurn;
+    options.record.warningCount = warning.warningCount;
+    options.record.lastWarningAt = new Date().toISOString();
+    options.record.lastWarningTurn = warning.turn;
+    applyLifecycleUsage(options.record, usageBaseline, lifecycle.snapshot.usage);
+    void persistTask(options.record).catch(() => {});
+    options.onProgressWarning?.(options.record, warning);
+  };
   options.record.status = "running";
   options.record.terminationKind = undefined;
   options.record.background = true;
@@ -1187,7 +1283,10 @@ export async function resumeCompletedTask(options: {
       const runProjectTrusted = options.record.projectTrusted ?? false;
       options.record.projectTrusted = runProjectTrusted;
       const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: runProjectTrusted });
-      const guard = createChildLifecycleExtension(resumeAgent, lifecycle, { maxTurns: persistedMaxTurns });
+      const guard = createChildLifecycleExtension(resumeAgent, lifecycle, {
+        maxTurns: persistedMaxTurns,
+        onProgressWarning: handleResumeProgressWarning,
+      });
       const skillLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noExtensions: true, noPromptTemplates: true, noThemes: true, noContextFiles: true });
       await skillLoader.reload();
       const skillPrompt = preloadedSkillPrompt(resumeAgent, skillLoader.getSkills().skills);
@@ -1229,6 +1328,7 @@ export async function resumeCompletedTask(options: {
           parentTask: options.record,
           taskQuota: options.parent.taskQuota,
           onComplete: options.onComplete,
+          onProgressWarning: options.onProgressWarning,
           onTaskStarted: options.onTaskStarted,
         })
         : undefined;
@@ -1313,25 +1413,32 @@ export async function resumeCompletedTask(options: {
     }
     return options.record;
   })();
-  return { record: options.record, abortController, promise, send: async message => {
-    await childReady;
-    if (!childSession) throw new Error("child session failed to resume");
-    if (!acceptingMessages) throw new Error("resumed child task is no longer accepting live messages");
-    const delivery = sendQueue.then(async () => {
-      if (abortController.signal.aborted) throw new Error("resumed child task is no longer accepting live messages");
-      if (!childSession) throw new Error("child session is unavailable");
-      if (childSession.isStreaming) await childSession.steer(message);
-      else await childSession.prompt(message, { expandPromptTemplates: false, source: "extension" });
-    });
-    sendQueue = delivery.catch(error => {
-      if (!abortController.signal.aborted) abortController.abort(error instanceof Error ? error : new Error(String(error)));
-    });
-    await delivery;
-  }, stop: async kind => {
-    if (lifecycle.snapshot.phase === "terminal") return;
-    lifecycle.requestStop(kind);
-    stopError = kind === "manual_stop" ? "Stopped by parent." : "Parent session shut down.";
-    abortController.abort(new Error(stopError));
-    if (childSession) await childSession.abort();
-  }};
+  return {
+    record: options.record,
+    abortController,
+    promise,
+    foregroundReleased: Promise.resolve(),
+    send: async message => {
+      await childReady;
+      if (!childSession) throw new Error("child session failed to resume");
+      if (!acceptingMessages) throw new Error("resumed child task is no longer accepting live messages");
+      const delivery = sendQueue.then(async () => {
+        if (abortController.signal.aborted) throw new Error("resumed child task is no longer accepting live messages");
+        if (!childSession) throw new Error("child session is unavailable");
+        if (childSession.isStreaming) await childSession.steer(message);
+        else await childSession.prompt(message, { expandPromptTemplates: false, source: "extension" });
+      });
+      sendQueue = delivery.catch(error => {
+        if (!abortController.signal.aborted) abortController.abort(error instanceof Error ? error : new Error(String(error)));
+      });
+      await delivery;
+    },
+    stop: async kind => {
+      if (lifecycle.snapshot.phase === "terminal") return;
+      lifecycle.requestStop(kind);
+      stopError = kind === "manual_stop" ? "Stopped by parent." : "Parent session shut down.";
+      abortController.abort(new Error(stopError));
+      if (childSession) await childSession.abort();
+    },
+  };
 }

@@ -88,7 +88,8 @@ The parent contract covers:
 - inherited-context Fork directives without recap, peeking, polling, or prediction
 - continuation based on useful retained state
 - completion-driven background workflow
-- inherited runtime defaults for normal work, with optional budgets for intentionally bounded probes
+- mandatory recurring progress supervision for normal work, with the first checkpoint at turn 30 and later checkpoints every 20 turns by default
+- hard budgets retained only as explicit custom-agent/runtime unattended policy
 - independent adversarial verification without waiting for the user and parent spot-checking
 - bounded, restrained nested delegation
 
@@ -102,7 +103,9 @@ Each launch and resume creates a new invocation controller:
 starting → working → final_handoff → terminal
 ```
 
-Turn and tool budgets are optional. When configured, `maxTurns` is a soft wrap-up threshold with `graceTurns` (default 1). At the threshold the runtime sends one constructive wrap-up instruction; tools remain available during grace so the child can finish a coherent step. Continuation past `maxTurns + graceTurns` becomes `partial/turn_budget`. `maxToolCalls` is the hard threshold of an optional tool budget; after it is reached, only tools in `toolBudgetBlock` (default `read`, `grep`, `find`, `ls`) are blocked. A valid final report after selected-tool blocking completes normally; only a missing usable report becomes `partial/tool_budget`. Timeout remains `partial/timeout` when a timer is configured. Explicit parent stop becomes `stopped/manual_stop`, parent shutdown becomes `stopped/parent_shutdown`, and startup/provider failures become `failed`.
+Every invocation also has a mandatory recurring supervision schedule. By default, a child that would continue after turn 30 emits a structured warning to the root parent; later warnings recur at turns 50, 70, and so on. Finishing at a checkpoint emits no warning. Warnings are persisted and deduplicated across reload/resume, do not abort or restrict the child, and are not termination kinds. The root parent may inspect once with `TaskOutput`, continue, steer with `SendMessage`, or stop with `TaskStop`. A foreground launch that reaches its first checkpoint is promoted to supervised background execution so the blocked parent regains control; its eventual completion is then delivered as a root follow-up.
+
+Turn and tool budgets remain optional advanced unattended policy. When configured, `maxTurns` is a soft wrap-up threshold with `graceTurns` (default 1). At the threshold the runtime sends one constructive wrap-up instruction; tools remain available during grace so the child can finish a coherent step. Continuation past `maxTurns + graceTurns` becomes `partial/turn_budget`. `maxToolCalls` is the hard threshold of an optional tool budget; after it is reached, only tools in `toolBudgetBlock` (default `read`, `grep`, `find`, `ls`) are blocked. A valid final report after selected-tool blocking completes normally; only a missing usable report becomes `partial/tool_budget`. Timeout remains `partial/timeout` when a timer is configured. Explicit parent stop becomes `stopped/manual_stop`, parent shutdown becomes `stopped/parent_shutdown`, and startup/provider failures become `failed`.
 
 Tool counters distinguish model requests, admitted executions, and blocks. Compatibility `toolCalls` equals executed calls. Pi `stopReason: aborted` is evidence, not the authoritative task status; explicit lifecycle causes take precedence.
 
@@ -159,7 +162,9 @@ Nested agents execute synchronously inside their direct parent AgentSession and 
 - exact role tool selection
 - read-only tool removal
 - inspect/verify shell allowlists
-- optional task timeout
+- mandatory recurring root-parent progress supervision with persisted checkpoints
+- foreground-to-supervised-background promotion at the first warning
+- optional task timeout for explicit unattended policy
 - optional soft turn budgets with grace
 - optional tool budgets with selected-tool blocking
 - root-shared FIFO concurrency semaphore
@@ -179,4 +184,4 @@ Nested agents execute synchronously inside their direct parent AgentSession and 
   session.jsonl
 ```
 
-Task records include ancestry, depth, role, status, termination kind, model, requested/effective thinking and clamp diagnostics, budgets, requested/executed/blocked usage, trust, output paths, worktree metadata, and lifecycle timestamps.
+Task records include ancestry, depth, role, status, termination kind, model, requested/effective thinking and clamp diagnostics, warning schedule/checkpoint state, optional hard budgets, requested/executed/blocked usage, trust, output paths, worktree metadata, and lifecycle timestamps.

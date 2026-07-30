@@ -12,6 +12,7 @@ import { Type } from "typebox";
 import { applyAgentModelSettings, discoverAgents, findAgent, resolvePackageRoot, type AgentDefinition } from "./agents.ts";
 import { agentAllowsNestedAgents, type ToolDescriptor } from "./capabilities.ts";
 import { loadAgentModelSettings, loadConfig, type PiSubagentsConfig } from "./config.ts";
+import { resolveWarningSchedule } from "./lifecycle.ts";
 import { buildAgentListing, buildAgentToolDescription, buildParentPolicy, classifyDispatch, resolveTaskIsolation } from "./prompts.ts";
 import { launchTask, resumeCompletedTask, createTaskQuota, type LaunchSpec, type ParentLaunchContext } from "./runtime.ts";
 import {
@@ -31,7 +32,7 @@ interface TaskDetails {
   tasks: TaskRecord[];
 }
 
-const TaskSpecSchema = Type.Object({
+export const TaskSpecSchema = Type.Object({
   description: Type.String({ description: "Short 3-5 word task summary" }),
   prompt: Type.String({ description: "Complete task briefing for the child agent" }),
   subagent_type: Type.Optional(Type.String({ description: "Specialized agent type. Omit for general-purpose; use 'fork' to inherit the current conversation." })),
@@ -41,12 +42,9 @@ const TaskSpecSchema = Type.Object({
   isolation: Type.Optional(StringEnum(["none", "worktree"] as const, { description: "Optional task isolation. Use none unless worktree isolation is explicitly required." })),
   cwd: Type.Optional(Type.String({ description: "Working directory; defaults to parent cwd" })),
   name: Type.Optional(Type.String({ description: "Optional addressable task name" })),
-  timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
-  max_turns: Type.Optional(Type.Number({ minimum: 1 })),
-  max_tool_calls: Type.Optional(Type.Number({ minimum: 1 })),
 });
 
-const AgentParams = Type.Object({
+export const AgentParams = Type.Object({
   description: Type.Optional(Type.String()),
   prompt: Type.Optional(Type.String()),
   subagent_type: Type.Optional(Type.String()),
@@ -56,9 +54,6 @@ const AgentParams = Type.Object({
   isolation: Type.Optional(StringEnum(["none", "worktree"] as const, { description: "Optional task isolation. Use none unless worktree isolation is explicitly required." })),
   cwd: Type.Optional(Type.String()),
   name: Type.Optional(Type.String()),
-  timeout_ms: Type.Optional(Type.Number({ minimum: 1000 })),
-  max_turns: Type.Optional(Type.Number({ minimum: 1 })),
-  max_tool_calls: Type.Optional(Type.Number({ minimum: 1 })),
   tasks: Type.Optional(Type.Array(TaskSpecSchema)),
 });
 
@@ -82,9 +77,6 @@ function compactAgentParams<T extends {
   cwd?: string;
   isolation?: string;
   thinking?: string;
-  max_turns?: number;
-  max_tool_calls?: number;
-  timeout_ms?: number;
 }>(params: T): T {
   const compacted = { ...params };
   if (!compacted.tasks?.length) delete compacted.tasks;
@@ -162,6 +154,35 @@ export function taskNotification(record: TaskRecord, result: string, includeUsag
   return sections.join("\n");
 }
 
+export function progressWarningNotification(record: TaskRecord, details: {
+  turn: number;
+  nextWarningTurn: number;
+  warningCount: number;
+  warningTurns: number;
+  warningIntervalTurns: number;
+}): string {
+  const usage = record.usage;
+  const startedMs = Date.parse(record.startedAt);
+  const elapsedMs = Number.isFinite(startedMs) ? Math.max(0, Date.now() - startedMs) : 0;
+  const elapsedSec = Math.round(elapsedMs / 1000);
+  const preview = (record.preview ?? "(no preview yet)").slice(0, 300);
+  const name = record.name ? ` name=${record.name}` : "";
+  return [
+    "<progress-warning>",
+    `<task-id>${xmlText(record.id)}</task-id>`,
+    name ? `<task-name>${xmlText(record.name!)}</task-name>` : undefined,
+    `<summary>${xmlText(record.description)}</summary>`,
+    `<agent>${xmlText(record.agent)}</agent>`,
+    `<status>${record.status}</status>`,
+    `<checkpoint turn="${details.turn}" next="${details.nextWarningTurn}" count="${details.warningCount}" first="${details.warningTurns}" interval="${details.warningIntervalTurns}"/>`,
+    `<usage><turns>${usage.turns}</turns><tool_calls_requested>${usage.toolCallsRequested}</tool_calls_requested><tool_calls_executed>${usage.toolCallsExecuted}</tool_calls_executed><tool_calls_blocked>${usage.toolCallsBlocked}</tool_calls_blocked></usage>`,
+    `<elapsed_seconds>${elapsedSec}</elapsed_seconds>`,
+    `<preview>${xmlText(preview)}</preview>`,
+    "<guidance>Progress warning is a supervision checkpoint, not a failure. Inspect once with TaskOutput, then continue, steer via SendMessage, or stop via TaskStop based on evidence. Do not poll in a loop.</guidance>",
+    "</progress-warning>",
+  ].filter(Boolean).join("\n");
+}
+
 function currentParent(pi: ExtensionAPI, ctx: ExtensionContext): ParentLaunchContext {
   const activeTools = new Set(pi.getActiveTools());
   return {
@@ -214,9 +235,6 @@ function normalizeTask(input: {
   isolation?: "none" | "worktree";
   cwd?: string;
   name?: string;
-  timeout_ms?: number;
-  max_turns?: number;
-  max_tool_calls?: number;
 }, agents: AgentDefinition[], config: PiSubagentsConfig, ctx: ExtensionContext): LaunchSpec {
   if (!input.description?.trim() || !input.prompt?.trim()) throw new Error("description and prompt are required");
   const dispatchInput = { ...input, isolation: input.isolation === "worktree" ? "worktree" as const : undefined };
@@ -234,6 +252,12 @@ function normalizeTask(input: {
   if (isolation === "worktree" && !config.enableWorktrees) throw new Error("worktree isolation is disabled");
   const requestedModel = normalizeOptionalModel(input.model, ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
   const model = requestedModel ? resolveRequestedModel(requestedModel, ctx.modelRegistry) : undefined;
+  const schedule = resolveWarningSchedule({
+    warningTurns: selected.warningTurns ?? config.warningTurns,
+    warningIntervalTurns: selected.warningIntervalTurns ?? config.warningIntervalTurns,
+    fallbackTurns: config.warningTurns,
+    fallbackInterval: config.warningIntervalTurns,
+  });
   return {
     agent: selected,
     prompt: input.prompt.trim(),
@@ -243,12 +267,15 @@ function normalizeTask(input: {
     forked,
     model,
     thinking: input.thinking?.trim() || undefined,
-    timeoutMs: input.timeout_ms ?? selected.timeoutMs ?? config.defaultTimeoutMs,
-    maxTurns: input.max_turns ?? selected.maxTurns ?? config.defaultMaxTurns,
+    // Hard budgets remain config/frontmatter unattended policy only — not public invocation args.
+    timeoutMs: selected.timeoutMs ?? config.defaultTimeoutMs,
+    maxTurns: selected.maxTurns ?? config.defaultMaxTurns,
     graceTurns: selected.graceTurns ?? config.defaultGraceTurns,
-    maxToolCalls: input.max_tool_calls ?? selected.maxToolCalls ?? config.defaultMaxToolCalls,
+    maxToolCalls: selected.maxToolCalls ?? config.defaultMaxToolCalls,
     softToolCalls: selected.softToolCalls ?? config.defaultSoftToolCalls,
     toolBudgetBlock: selected.toolBudgetBlock ?? config.defaultToolBudgetBlock,
+    warningTurns: schedule.warningTurns,
+    warningIntervalTurns: schedule.warningIntervalTurns,
     isolation,
     toolInventory: undefined,
     allowNestedAgent: config.enableNestedAgents && agentAllowsNestedAgents(selected) && config.maxAgentDepth > 1 && !forked,
@@ -302,6 +329,7 @@ export default function register(pi: ExtensionAPI): void {
     if (quotaTasks.delete(record.id)) taskQuota.release();
     known.set(record.id, record);
     live.delete(record.id);
+    // Nested completions stay with the direct parent; root-only delivery for background tasks.
     if (record.parentTaskId || !record.background) return;
     const result = formatTaskOutputForModel(record, {
       bytes: currentConfig.maxOutputBytes,
@@ -320,6 +348,29 @@ export default function register(pi: ExtensionAPI): void {
     if (quotaTasks.delete(record.id)) taskQuota.release();
     known.set(record.id, record);
     live.delete(record.id);
+  };
+
+  const handleTaskCompletion = (record: TaskRecord) => {
+    // Ordinary foreground completion returns through the tool call. Once the first warning
+    // promotes it to background, final completion must be delivered to the root parent.
+    if (record.background) notifyCompletion(record);
+    else finalizeForegroundTask(record);
+  };
+
+  const notifyProgressWarning = (record: TaskRecord, details: {
+    turn: number;
+    nextWarningTurn: number;
+    warningCount: number;
+    warningTurns: number;
+    warningIntervalTurns: number;
+  }) => {
+    known.set(record.id, record);
+    pi.sendMessage({
+      customType: "pi-subagent-progress-warning",
+      content: progressWarningNotification(record, details),
+      display: true,
+      details: { ...record, progressWarning: details },
+    }, { triggerTurn: true, deliverAs: "followUp" });
   };
 
   pi.on("session_start", (_event, ctx) => {
@@ -359,6 +410,14 @@ export default function register(pi: ExtensionAPI): void {
     return new Text(`${icon} ${theme.bold(record.description)} ${theme.fg("dim", record.status)}\n  ${theme.fg("dim", preview)}`, 0, 0);
   });
 
+  pi.registerMessageRenderer("pi-subagent-progress-warning", (message, _options, theme) => {
+    const details = message.details as (TaskRecord & { progressWarning?: { turn?: number; nextWarningTurn?: number } }) | undefined;
+    const turn = details?.progressWarning?.turn ?? details?.lastWarningTurn ?? "?";
+    const next = details?.progressWarning?.nextWarningTurn ?? details?.nextWarningTurn ?? "?";
+    const label = details?.description ?? "Subagent";
+    return new Text(`${theme.fg("warning", "⚠")} ${theme.bold(label)} ${theme.fg("dim", `progress warning @ turn ${turn}; next ${next}`)}`, 0, 0);
+  });
+
   pi.registerTool({
     name: "Agent",
     label: "Agent",
@@ -369,7 +428,7 @@ export default function register(pi: ExtensionAPI): void {
       "Delegate implementation needing more than a couple of edits, isolation, broad validation, or substantial intermediate tool output unless it is tightly scoped and direct execution is clearly cheaper.",
       "Named agents start Fresh. Explain the goal and why, known evidence and ruled-out paths, exact files/errors, scope, success criteria, validation, and expected response. Never delegate understanding: synthesize research into concrete implementation instructions.",
       "In interactive Pi, Agent launches in the background by default. Do not poll, peek, duplicate, or predict the result. Continue only non-overlapping work, or briefly state what is running and end the turn.",
-      "Use subagent_type: fork only for root-session work that needs the persisted conversation and decisions. Normal tasks inherit role and runtime defaults; set timeout, turn, or tool budgets only for intentionally bounded probes, and leave implementation room for validation.",
+      "Use subagent_type: fork only for root-session work that needs the persisted conversation and decisions. Ordinary calls inherit role and runtime policy; do not set turn/tool/timeout budgets on the call. Progress warnings are supervision checkpoints: inspect once with TaskOutput, then continue, SendMessage, or TaskStop based on evidence.",
     ],
     description: buildAgentToolDescription(currentAgents, currentConfig),
     parameters: AgentParams,
@@ -409,7 +468,8 @@ export default function register(pi: ExtensionAPI): void {
               parent,
               config: currentConfig,
               agents: currentAgents,
-              onComplete: spec.background ? notifyCompletion : finalizeForegroundTask,
+              onComplete: handleTaskCompletion,
+              onProgressWarning: notifyProgressWarning,
               onTaskStarted: nested => {
                 known.set(nested.record.id, nested.record);
                 live.set(nested.record.id, nested);
@@ -443,14 +503,24 @@ export default function register(pi: ExtensionAPI): void {
       }
       signal?.removeEventListener("abort", abortLaunched);
       const foreground = launched.filter(task => !task.record.background);
-      if (foreground.length > 0) await Promise.all(foreground.map(task => task.promise));
+      if (foreground.length > 0) {
+        // First progress warning releases the foreground wait while the child keeps running.
+        await Promise.all(foreground.map(task => Promise.race([
+          task.promise,
+          task.foregroundReleased ?? new Promise<void>(() => {}),
+        ])));
+      }
       const summaries = launched.map(task => {
-        return task.record.background
-          ? `Async agent launched successfully.\ntask_id: ${task.record.id} (internal operational ID; do not mention it to the user)\noutput_file: ${task.record.outputFile}\nThe agent is running in the background and completion will be delivered automatically. Do not sleep, poll TaskOutput, or duplicate this task. Continue only with non-overlapping work, or briefly tell the user what was launched and end the turn.`
-          : `### ${task.record.description}\n${formatTaskOutputForModel(task.record, {
-            bytes: currentConfig.maxOutputBytes,
-            lines: currentConfig.maxOutputLines,
-          })}`;
+        if (task.record.status === "running" && task.record.lastWarningTurn !== undefined) {
+          return `### ${task.record.description}\nstatus: running (supervised background)\ntask_id: ${task.record.id}\noutput_file: ${task.record.outputFile}\nturns: ${task.record.usage.turns}\nnext_warning_turn: ${task.record.nextWarningTurn ?? "n/a"}\n\nForeground wait released by a progress-warning supervision checkpoint. The child is still running and holds its concurrency slot until actual completion. Completion and subsequent warnings will arrive as follow-up messages. Inspect once with TaskOutput if needed, then continue, steer via SendMessage, or stop via TaskStop based on evidence.`;
+        }
+        if (task.record.background) {
+          return `Async agent launched successfully.\ntask_id: ${task.record.id} (internal operational ID; do not mention it to the user)\noutput_file: ${task.record.outputFile}\nThe agent is running in the background and completion will be delivered automatically. Progress warnings are automatic supervision checkpoints; do not sleep, poll TaskOutput in a loop, or duplicate this task. Continue only with non-overlapping work, or briefly tell the user what was launched and end the turn.`;
+        }
+        return `### ${task.record.description}\n${formatTaskOutputForModel(task.record, {
+          bytes: currentConfig.maxOutputBytes,
+          lines: currentConfig.maxOutputLines,
+        })}`;
       });
       return taskResult(launched.map(task => task.record), summaries.join("\n\n"));
     },
@@ -520,6 +590,7 @@ export default function register(pi: ExtensionAPI): void {
             quotaTasks.add(nested.record.id);
           },
           onComplete: notifyCompletion,
+          onProgressWarning: notifyProgressWarning,
         });
         live.set(record.id, resumed);
         quotaTasks.add(record.id);
@@ -534,7 +605,7 @@ export default function register(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "TaskOutput",
     label: "Task Output",
-    description: "Read a child task snapshot or explicitly wait for completion. Background completion is delivered automatically, so do not use TaskOutput as a polling loop. Use it only when the user explicitly requests progress/status or for operational diagnosis.",
+    description: "Read a child task snapshot or explicitly wait for completion. Background completion and progress warnings are delivered automatically. A progress warning legitimizes one TaskOutput inspection, then deliberate continue/SendMessage/TaskStop — not a polling loop. Use block waits only when the user explicitly requests status or for operational diagnosis.",
     parameters: TaskOutputParams,
     executionMode: "parallel",
     async execute(_id, params, signal) {

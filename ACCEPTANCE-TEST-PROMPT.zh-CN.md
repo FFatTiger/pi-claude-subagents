@@ -203,67 +203,55 @@ node -e "setTimeout(() => console.log('LONG_TASK_FINISHED'), 60000)"
 - 已有部分输出被保留；
 - 配额在停止后释放。
 
-## 阶段 8：默认无预算与 thinking 诊断
+## 阶段 8：公开参数移除、默认监督与 thinking 诊断
 
-启动一个不带 `max_turns`、`max_tool_calls`、`timeout_ms` 的 `general-purpose` 前台任务，thinking 显式设为 `high`，要求它完成三轮不同的读取/搜索后汇报。
+检查 Agent 工具的单任务和 `tasks` 子项 schema，确认不再暴露 `max_turns`、`max_tool_calls`、`timeout_ms`。随后启动一个普通 `general-purpose` 前台任务，thinking 显式设为 `high`，要求它完成三轮不同的读取/搜索后汇报。
 
 完成后读取对应 `task.json`。
 
 验收点：
 
+- 公开 Agent 调用没有三项硬预算参数；
+- `warningTurns` 为 30，`warningIntervalTurns` 为 20，`nextWarningTurn` 为 30；
 - `maxTurns`、`maxToolCalls`、`timeoutMs` 没有被默认写成旧的 80/120/30 分钟；
 - requested thinking 为 high；
 - effective thinking 为 high，或存在明确的 clamp reason；
 - 任务能正常完成多轮工作。
 
-## 阶段 9：软回合预算与 grace
+## 阶段 9：重复监督提醒与前台释放
 
-启动前台 `general-purpose`：
-
-- `max_turns: 1`；
-- 任务要求第一回合读取 `resume-context.txt`，随后在下一回合返回 marker 和 `TURN_GRACE_OK`。
+创建一个测试专用自定义 `general-purpose` 覆盖角色，将 `warningTurns` 设为 2、`warningIntervalTurns` 设为 2，不配置硬预算。前台启动一个会持续至少 5 轮、每轮都有明确进展 marker 的任务。
 
 验收点：
 
-- 第一回合仍允许真实工具工作；
-- 收尾提示后存在 grace 回合；
-- 总回合数可以是 2，但不会发生旧式“第一回合直接禁用工具”；
-- 有有效报告时状态为 completed/normal；
-- 输出包含 `RESUME_CONTEXT_OK` 和 `TURN_GRACE_OK`。
+- 第 2 轮仍准备继续时发送第一次结构化 progress warning；
+- 前台 Agent 工具在第一次 warning 后返回，但子任务保持 running 并继续持有配额；
+- task 被提升为 supervised background，最终完成时根会话仍收到 completion follow-up；
+- 第 4 轮仍继续时再次提醒，同一 checkpoint 不重复；
+- warning 不注入收尾提示、不阻止工具、不改变 termination kind；
+- 如果任务恰好在 checkpoint 完成，则该 checkpoint 不提醒；
+- `TaskOutput` 可在 warning 后检查一次，随后可选择继续、`SendMessage` 或 `TaskStop`。
 
-## 阶段 10：选择性工具预算
+## 阶段 10：恢复后的 checkpoint 去重
 
-启动前台 `general-purpose`：
-
-- `max_tool_calls: 1`；
-- 指令要求先读取 `parallel-a.txt`，再读取 `parallel-b.txt`，然后使用允许的现有上下文生成最终报告；
-- 最终报告加入 `TOOL_BUDGET_OK`。
-
-完成后检查 task usage。
+让一个可恢复任务经过第一次 warning 后完成，再用 `SendMessage` 恢复并继续到下一个 checkpoint。
 
 验收点：
 
-- 第一个 read 执行；
-- 达到硬阈值后，后续受控 read/grep/find/ls 被阻止；
-- requested、executed、blocked 三个计数含义正确；
-- 子代理仍能生成有效最终文本；
-- 有有效报告时任务允许 completed/normal，而不是机械标成 partial；
-- 输出含 `TOOL_BUDGET_OK`。
+- `warningCount`、`lastWarningTurn`、`nextWarningTurn` 持久化；
+- resume 不重发已经触发的 checkpoint；
+- 后续提醒按照原 interval 继续；
+- 旧 task record 没有 warning 字段时，安全补齐正整数默认值。
 
-## 阶段 11：显式超时
+## 阶段 11：高级硬预算兼容
 
-启动一个前台 `general-purpose` 任务：
+硬预算不再通过普通 Agent 调用传入。分别创建测试专用自定义 Agent frontmatter 或运行时配置来验证：
 
-- `timeout_ms: 1500`；
-- 第一动作运行一个明显超过 1.5 秒的命令，例如 10 秒计时器；
-- 在命令前先输出或形成一个简短进度证据。
-
-验收点：
-
-- 状态为 `partial`；
-- termination kind 为 `timeout`；
-- 错误信息包含实际 timeout 值；
-- 历史进度文本不会被错误冒充为成功的最终 handoff。
+- `maxTurns: 1` 与 grace 仍能请求收尾并保留有效报告；
+- `maxToolCalls: 1` 仍只阻止配置的工具集合；
+- `timeoutMs: 1500` 仍产生 `partial/timeout`；
+- 历史 task record 仍可读取、诊断和恢复；
+- README/DESIGN 将这些字段描述为高级无人值守策略，而不是普通调用参数。
 
 ## 阶段 12：嵌套代理
 

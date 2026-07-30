@@ -47,17 +47,18 @@ test("parent policy keeps known narrow work direct and forbids polling or predic
   assert.doesNotMatch(policy, /Use agents proactively but not excessively\./);
 });
 
-test("parent policy uses inherited runtime defaults and targeted optional budgets", () => {
+test("parent policy uses mandatory recurring progress supervision", () => {
   const policy = buildParentPolicy(agents, DEFAULT_CONFIG);
-  assert.match(policy, /normal tasks inherit the selected role and runtime defaults/i);
-  assert.match(policy, /intentionally bounded.*probe|bounded read-only probe/is);
-  assert.match(policy, /implementation.*enough room.*validation/is);
-  assert.match(policy, /wrap-up.*concise.*report/is);
+  assert.match(policy, /ordinary Agent calls inherit role and runtime policy/i);
+  assert.match(policy, /first at turn 30.*every 20 turns/is);
+  assert.match(policy, /inspect once with TaskOutput/i);
+  assert.match(policy, /continue.*SendMessage.*TaskStop/is);
+  assert.match(policy, /foreground launches release.*supervised running task/is);
 });
 
-test("short Agent description carries constructive budget guidance", () => {
+test("short Agent description carries constructive supervision guidance", () => {
   const description = buildAgentToolDescription(agents, DEFAULT_CONFIG);
-  assert.match(description, /normal tasks inherit/i);
-  assert.match(description, /bounded read-only probe/i);
-  assert.match(description, /implementation.*validation/is);
+  assert.match(description, /ordinary calls inherit/i);
+  assert.match(description, /progress warnings.*supervision checkpoints/is);
+  assert.match(description, /TaskOutput.*continue.*SendMessage.*TaskStop/is);
 });

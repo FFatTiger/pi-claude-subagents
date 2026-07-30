@@ -27,6 +27,10 @@ export interface AgentDefinition {
   softToolCalls?: number;
   toolBudgetBlock?: string[] | "*";
   timeoutMs?: number;
+  /** First progress-warning checkpoint override (absolute turns). */
+  warningTurns?: number;
+  /** Interval between subsequent progress-warning checkpoints. */
+  warningIntervalTurns?: number;
   isolation?: AgentIsolationMode;
   oneShot?: boolean;
   source: "builtin" | "user" | "project";
@@ -161,6 +165,8 @@ function parseAgentFile(filePath: string, source: AgentDefinition["source"]): Ag
     softToolCalls: parsePositiveInt(frontmatter.softToolCalls),
     toolBudgetBlock: parseToolBudgetBlock(frontmatter.toolBudgetBlock),
     timeoutMs: parsePositiveInt(frontmatter.timeoutMs),
+    warningTurns: parsePositiveInt(frontmatter.warningTurns),
+    warningIntervalTurns: parsePositiveInt(frontmatter.warningIntervalTurns),
     isolation,
     oneShot: parseBool(frontmatter.oneShot),
     source,
