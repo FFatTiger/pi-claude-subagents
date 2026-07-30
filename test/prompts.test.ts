@@ -47,18 +47,20 @@ test("parent policy keeps known narrow work direct and forbids polling or predic
   assert.doesNotMatch(policy, /Use agents proactively but not excessively\./);
 });
 
-test("parent policy uses mandatory recurring progress supervision", () => {
+test("parent policy requires explicit recurring progress supervision", () => {
   const policy = buildParentPolicy(agents, DEFAULT_CONFIG);
-  assert.match(policy, /ordinary Agent calls inherit role and runtime policy/i);
-  assert.match(policy, /first at turn 30.*every 20 turns/is);
+  assert.match(policy, /root Agent call always supplies explicit positive/i);
+  assert.match(policy, /warning_turns.*warning_interval_turns/is);
+  assert.match(policy, /tasks array.*inherit.*top-level/is);
   assert.match(policy, /inspect once with TaskOutput/i);
   assert.match(policy, /continue.*SendMessage.*TaskStop/is);
   assert.match(policy, /foreground launches release.*supervised running task/is);
 });
 
-test("short Agent description carries constructive supervision guidance", () => {
+test("short Agent description requires explicit supervision values", () => {
   const description = buildAgentToolDescription(agents, DEFAULT_CONFIG);
-  assert.match(description, /ordinary calls inherit/i);
-  assert.match(description, /progress warnings.*supervision checkpoints/is);
+  assert.match(description, /every root call explicitly supplies/i);
+  assert.match(description, /warning_turns.*warning_interval_turns/is);
+  assert.match(description, /tasks-array children inherit/i);
   assert.match(description, /TaskOutput.*continue.*SendMessage.*TaskStop/is);
 });

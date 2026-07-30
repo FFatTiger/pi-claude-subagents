@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import register, { AgentParams, TaskSpecSchema, createCompletionDeduper, formatTaskDiagnostic, progressWarningNotification, taskNotification } from "../src/index.ts";
+import register, { AgentParams, TaskSpecSchema, createCompletionDeduper, formatTaskDiagnostic, inheritTaskWarningPolicy, progressWarningNotification, taskNotification } from "../src/index.ts";
 import type { TaskRecord } from "../src/tasks.ts";
 
 function partialTask(): TaskRecord {
@@ -43,15 +43,36 @@ function partialTask(): TaskRecord {
   };
 }
 
-test("public Agent schemas omit invocation hard budgets", () => {
-  const topLevel = AgentParams as unknown as { properties: Record<string, unknown> };
-  const taskLevel = TaskSpecSchema as unknown as { properties: Record<string, unknown> };
+test("public Agent schemas require explicit supervision and omit hard budgets", () => {
+  const topLevel = AgentParams as unknown as { properties: Record<string, unknown>; required?: string[] };
+  const taskLevel = TaskSpecSchema as unknown as { properties: Record<string, unknown>; required?: string[] };
   for (const schema of [topLevel, taskLevel]) {
     assert.equal("max_turns" in schema.properties, false);
     assert.equal("max_tool_calls" in schema.properties, false);
     assert.equal("timeout_ms" in schema.properties, false);
   }
+  assert.equal("warning_turns" in topLevel.properties, true);
+  assert.equal("warning_interval_turns" in topLevel.properties, true);
+  assert.ok(topLevel.required?.includes("warning_turns"));
+  assert.ok(topLevel.required?.includes("warning_interval_turns"));
+  assert.equal("warning_turns" in taskLevel.properties, true);
+  assert.equal("warning_interval_turns" in taskLevel.properties, true);
+  assert.equal(taskLevel.required?.includes("warning_turns") ?? false, false);
+  assert.equal(taskLevel.required?.includes("warning_interval_turns") ?? false, false);
   assert.equal(typeof register, "function");
+});
+
+test("tasks-array warning policy inherits top-level values and preserves overrides", () => {
+  const tasks = inheritTaskWarningPolicy([
+    { description: "inherit" },
+    { description: "override first", warning_turns: 12 },
+    { description: "override both", warning_turns: 8, warning_interval_turns: 3 },
+  ], { warning_turns: 30, warning_interval_turns: 20 });
+  assert.deepEqual(tasks, [
+    { description: "inherit", warning_turns: 30, warning_interval_turns: 20 },
+    { description: "override first", warning_turns: 12, warning_interval_turns: 20 },
+    { description: "override both", warning_turns: 8, warning_interval_turns: 3 },
+  ]);
 });
 
 test("progress warning notification is structured and actionable", () => {

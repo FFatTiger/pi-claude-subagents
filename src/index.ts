@@ -42,6 +42,8 @@ export const TaskSpecSchema = Type.Object({
   isolation: Type.Optional(StringEnum(["none", "worktree"] as const, { description: "Optional task isolation. Use none unless worktree isolation is explicitly required." })),
   cwd: Type.Optional(Type.String({ description: "Working directory; defaults to parent cwd" })),
   name: Type.Optional(Type.String({ description: "Optional addressable task name" })),
+  warning_turns: Type.Optional(Type.Integer({ minimum: 1, description: "Optional per-task override for the first supervision checkpoint; inherits the required top-level warning_turns." })),
+  warning_interval_turns: Type.Optional(Type.Integer({ minimum: 1, description: "Optional per-task override for recurring supervision checkpoints; inherits the required top-level warning_interval_turns." })),
 });
 
 export const AgentParams = Type.Object({
@@ -54,6 +56,8 @@ export const AgentParams = Type.Object({
   isolation: Type.Optional(StringEnum(["none", "worktree"] as const, { description: "Optional task isolation. Use none unless worktree isolation is explicitly required." })),
   cwd: Type.Optional(Type.String()),
   name: Type.Optional(Type.String()),
+  warning_turns: Type.Integer({ minimum: 1, description: "Required first progress-supervision checkpoint. Use the runtime policy default (normally 30) unless a deliberate task policy specifies another value." }),
+  warning_interval_turns: Type.Integer({ minimum: 1, description: "Required interval for later progress-supervision checkpoints. Use the runtime policy default (normally 20) unless a deliberate task policy specifies another value." }),
   tasks: Type.Optional(Type.Array(TaskSpecSchema)),
 });
 
@@ -77,6 +81,8 @@ function compactAgentParams<T extends {
   cwd?: string;
   isolation?: string;
   thinking?: string;
+  warning_turns?: number;
+  warning_interval_turns?: number;
 }>(params: T): T {
   const compacted = { ...params };
   if (!compacted.tasks?.length) delete compacted.tasks;
@@ -85,6 +91,17 @@ function compactAgentParams<T extends {
   if (!compacted.cwd?.trim()) delete compacted.cwd;
   if (compacted.isolation !== "worktree" && compacted.isolation !== "none") delete compacted.isolation;
   return compacted;
+}
+
+export function inheritTaskWarningPolicy<T extends {
+  warning_turns?: number;
+  warning_interval_turns?: number;
+}>(tasks: T[], parent: { warning_turns: number; warning_interval_turns: number }): T[] {
+  return tasks.map(task => ({
+    ...task,
+    warning_turns: task.warning_turns ?? parent.warning_turns,
+    warning_interval_turns: task.warning_interval_turns ?? parent.warning_interval_turns,
+  }));
 }
 
 function normalizeOptionalModel(model: string | undefined, parentModel: string | undefined): string | undefined {
@@ -235,6 +252,8 @@ function normalizeTask(input: {
   isolation?: "none" | "worktree";
   cwd?: string;
   name?: string;
+  warning_turns?: number;
+  warning_interval_turns?: number;
 }, agents: AgentDefinition[], config: PiSubagentsConfig, ctx: ExtensionContext): LaunchSpec {
   if (!input.description?.trim() || !input.prompt?.trim()) throw new Error("description and prompt are required");
   const dispatchInput = { ...input, isolation: input.isolation === "worktree" ? "worktree" as const : undefined };
@@ -253,8 +272,8 @@ function normalizeTask(input: {
   const requestedModel = normalizeOptionalModel(input.model, ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
   const model = requestedModel ? resolveRequestedModel(requestedModel, ctx.modelRegistry) : undefined;
   const schedule = resolveWarningSchedule({
-    warningTurns: selected.warningTurns ?? config.warningTurns,
-    warningIntervalTurns: selected.warningIntervalTurns ?? config.warningIntervalTurns,
+    warningTurns: input.warning_turns ?? selected.warningTurns ?? config.warningTurns,
+    warningIntervalTurns: input.warning_interval_turns ?? selected.warningIntervalTurns ?? config.warningIntervalTurns,
     fallbackTurns: config.warningTurns,
     fallbackInterval: config.warningIntervalTurns,
   });
@@ -428,7 +447,7 @@ export default function register(pi: ExtensionAPI): void {
       "Delegate implementation needing more than a couple of edits, isolation, broad validation, or substantial intermediate tool output unless it is tightly scoped and direct execution is clearly cheaper.",
       "Named agents start Fresh. Explain the goal and why, known evidence and ruled-out paths, exact files/errors, scope, success criteria, validation, and expected response. Never delegate understanding: synthesize research into concrete implementation instructions.",
       "In interactive Pi, Agent launches in the background by default. Do not poll, peek, duplicate, or predict the result. Continue only non-overlapping work, or briefly state what is running and end the turn.",
-      "Use subagent_type: fork only for root-session work that needs the persisted conversation and decisions. Ordinary calls inherit role and runtime policy; do not set turn/tool/timeout budgets on the call. Progress warnings are supervision checkpoints: inspect once with TaskOutput, then continue, SendMessage, or TaskStop based on evidence.",
+      "Use subagent_type: fork only for root-session work that needs the persisted conversation and decisions. Every root call explicitly supplies positive warning_turns and warning_interval_turns (normally the runtime defaults). Tasks-array children inherit the top-level values unless deliberately overridden. Progress warnings are supervision checkpoints: inspect once with TaskOutput, then continue, SendMessage, or TaskStop based on evidence.",
     ],
     description: buildAgentToolDescription(currentAgents, currentConfig),
     parameters: AgentParams,
@@ -436,7 +455,12 @@ export default function register(pi: ExtensionAPI): void {
     async execute(_id, params, signal, onUpdate, ctx) {
       reload(ctx);
       params = compactAgentParams(params);
-      const rawTasks = params.tasks?.length ? params.tasks : [params];
+      const rawTasks = params.tasks?.length
+        ? inheritTaskWarningPolicy(params.tasks, {
+          warning_turns: params.warning_turns,
+          warning_interval_turns: params.warning_interval_turns,
+        })
+        : [params];
       if (rawTasks.length > currentConfig.maxTasksPerLaunch) return taskResult([], `Too many tasks (${rawTasks.length}); max is ${currentConfig.maxTasksPerLaunch}.`, true);
       const specs: LaunchSpec[] = [];
       const parent = {

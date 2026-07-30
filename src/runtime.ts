@@ -672,6 +672,8 @@ export function createNestedAgentAdapter(options: NestedAgentAdapterOptions): To
     isolation: Type.Optional(Type.Union([Type.Literal("none"), Type.Literal("worktree")])),
     cwd: Type.Optional(Type.String()),
     name: Type.Optional(Type.String()),
+    warning_turns: Type.Integer({ minimum: 1, description: `Required first supervision checkpoint; normally ${options.config.warningTurns}.` }),
+    warning_interval_turns: Type.Integer({ minimum: 1, description: `Required recurring checkpoint interval; normally ${options.config.warningIntervalTurns}.` }),
   });
   return defineTool({
     name: "Agent",
@@ -692,8 +694,8 @@ export function createNestedAgentAdapter(options: NestedAgentAdapterOptions): To
       await options.taskQuota.acquireDependency(signal ?? undefined);
       try {
         const nestedSchedule = resolveWarningSchedule({
-          warningTurns: selected.warningTurns ?? options.config.warningTurns,
-          warningIntervalTurns: selected.warningIntervalTurns ?? options.config.warningIntervalTurns,
+          warningTurns: params.warning_turns,
+          warningIntervalTurns: params.warning_interval_turns,
           fallbackTurns: options.config.warningTurns,
           fallbackInterval: options.config.warningIntervalTurns,
         });

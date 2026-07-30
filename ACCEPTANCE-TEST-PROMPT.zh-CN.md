@@ -205,13 +205,14 @@ node -e "setTimeout(() => console.log('LONG_TASK_FINISHED'), 60000)"
 
 ## 阶段 8：公开参数移除、默认监督与 thinking 诊断
 
-检查 Agent 工具的单任务和 `tasks` 子项 schema，确认不再暴露 `max_turns`、`max_tool_calls`、`timeout_ms`。随后启动一个普通 `general-purpose` 前台任务，thinking 显式设为 `high`，要求它完成三轮不同的读取/搜索后汇报。
+检查 Agent 工具的单任务和 `tasks` 子项 schema，确认不再暴露 `max_turns`、`max_tool_calls`、`timeout_ms`，同时根调用必须显式填写 `warning_turns: 30` 与 `warning_interval_turns: 20`；批量子项可以覆盖，否则继承顶层值。随后启动一个普通 `general-purpose` 前台任务，thinking 显式设为 `high`，要求它完成三轮不同的读取/搜索后汇报。
 
 完成后读取对应 `task.json`。
 
 验收点：
 
-- 公开 Agent 调用没有三项硬预算参数；
+- 公开 Agent 调用没有三项硬预算参数，但根调用必须显式包含两个正整数 warning 参数；
+- tasks-array 子项不重复填写时继承顶层 warning 值，显式覆盖时使用子项值；
 - `warningTurns` 为 30，`warningIntervalTurns` 为 20，`nextWarningTurn` 为 30；
 - `maxTurns`、`maxToolCalls`、`timeoutMs` 没有被默认写成旧的 80/120/30 分钟；
 - requested thinking 为 high；

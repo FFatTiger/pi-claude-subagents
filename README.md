@@ -16,10 +16,10 @@ Pick one install path:
 
 ```bash
 # npm
-pi install npm:pi-claude-subagents@0.3.0
+pi install npm:pi-claude-subagents@0.3.1
 
 # GitHub release
-pi install git:github.com/FFatTiger/pi-claude-subagents@v0.3.0
+pi install git:github.com/FFatTiger/pi-claude-subagents@v0.3.1
 
 # local checkout
 pi install /absolute/path/to/pi-claude-subagents
@@ -204,7 +204,9 @@ Runtime enforcement includes:
 - Exact role tool selection; read-only roles lose edit/write
 - Shell policies: `inspect`, `verify`, `unrestricted`
 - Lifecycle phases: `starting → working → final_handoff → terminal`
-- Mandatory recurring progress supervision: first warning at turn 30, then every 20 turns by default
+- Each root `Agent` invocation explicitly carries positive `warning_turns` and `warning_interval_turns`; use `30` and `20` for the standard policy
+- In a `tasks` array, child entries inherit the required top-level warning values unless deliberately overridden
+- Mandatory recurring progress supervision follows those supplied checkpoints
 - Warnings reach the root parent without stopping the child, restricting tools, or changing task status
 - A foreground task is promoted to supervised background execution on its first warning so the parent can inspect, steer, or stop it
 - Optional soft `maxTurns` + grace window for explicit unattended policy (default grace 1)
@@ -262,7 +264,7 @@ Trusted project:
 }
 ```
 
-Defaults leave hard timeout, turn, tool, and cleanup budgets unset, while mandatory progress supervision starts at turn 30 and repeats every 20 turns. Invalid, zero, or null warning values fall back to a positive inherited/default value rather than disabling supervision. Positive `cleanupPeriodDays` enables age-based retention cleanup. Legacy `maxOutputChars` still maps to `maxOutputBytes`. Bundled roles declare no hard budgets; custom frontmatter and runtime config can still define advanced unattended policies.
+The public `Agent` schema requires `warning_turns` and `warning_interval_turns` on every root call; standard calls use `30` and `20`. Tasks-array entries inherit those top-level values unless deliberately overridden. Defaults leave hard timeout, turn, tool, and cleanup budgets unset. Invalid, zero, or null persisted/config warning values fall back to a positive inherited/default value rather than disabling supervision. Positive `cleanupPeriodDays` enables age-based retention cleanup. Legacy `maxOutputChars` still maps to `maxOutputBytes`. Bundled roles declare no hard budgets; custom frontmatter and runtime config can still define advanced unattended policies.
 
 ## Persistence
 
