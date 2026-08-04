@@ -177,11 +177,14 @@ Nested agents execute synchronously inside their direct parent AgentSession and 
 
 ## Persistence
 
+Task metadata and output artifacts:
+
 ```text
 <getAgentDir()>/pi-claude-subagents/<root-session-id>/<task-id>/
   task.json
   output.md
-  session.jsonl
 ```
+
+Child session JSONL files live in Pi's standard session catalogue (`<getAgentDir()>/sessions/<project>/...`, normally `~/.pi/agent/sessions/<project>/...`), not under the task artifact directory. Fresh children are created in the parent session file's directory with `parentSession` set to the absolute parent session path when available; otherwise they use Pi's default catalogue for the child cwd. Fork children remain at the path returned by `createBranchedSession()` (also in the parent catalogue) with the branched `parentSession` header. `TaskRecord.sessionFile` stores that external standard path for resume and tooling. Age-based task cleanup removes only task metadata/output directories and must not delete standard child sessions.
 
 Task records include ancestry, depth, role, status, termination kind, model, requested/effective thinking and clamp diagnostics, warning schedule/checkpoint state, optional hard budgets, requested/executed/blocked usage, trust, output paths, worktree metadata, and lifecycle timestamps.

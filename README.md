@@ -269,12 +269,15 @@ The public `Agent` schema requires `warning_turns` and `warning_interval_turns` 
 
 ## Persistence
 
+Task metadata and output artifacts:
+
 ```text
 <getAgentDir()>/pi-claude-subagents/<root-session-id>/<task-id>/
   task.json
   output.md
-  session.jsonl
 ```
+
+Child session JSONL lives in Pi's standard session catalogue (`<getAgentDir()>/sessions/<project>/...`, normally `~/.pi/agent/sessions/<project>/...`), colocated with the parent session when a parent session file is available. `TaskRecord.sessionFile` stores that external standard path. Task cleanup removes only task metadata/output directories and does not delete standard child sessions.
 
 ## Commands
 

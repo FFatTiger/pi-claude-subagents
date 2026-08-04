@@ -8,7 +8,7 @@ import { applyAgentModelSettings, discoverAgents, findAgent } from "../src/agent
 import { agentAllowsNestedAgents, resolveAgentTools } from "../src/capabilities.ts";
 import { applyConfig, DEFAULT_CONFIG, loadAgentModelSettings } from "../src/config.ts";
 import { buildAgentToolDescription, buildParentPolicy, classifyDispatch, resolveTaskIsolation } from "../src/prompts.ts";
-import { createTaskQuota, finalNewTurnText, isMutatingShellCommand, isReadOnlyShellCommand, isShellCommandAllowed, prepareForkSession, validateAgentDefinition } from "../src/runtime.ts";
+import { createFreshChildSessionManager, createTaskQuota, finalNewTurnText, isMutatingShellCommand, isReadOnlyShellCommand, isShellCommandAllowed, prepareForkSession, validateAgentDefinition } from "../src/runtime.ts";
 import { formatTaskOutputForModel, type TaskRecord } from "../src/tasks.ts";
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -344,6 +344,96 @@ test("agent validation rejects unsafe definitions", () => {
   assert.throws(() => validateAgentDefinition({ ...base, name: "bad", readonly: true, shellPolicy: "unrestricted" }), /requires shellPolicy/);
 });
 
+test("fresh child sessions live in the parent catalogue with parentSession", async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fresh-session-"));
+  const sessionDir = path.join(cwd, "sessions");
+  const { SessionManager } = await import("@earendil-works/pi-coding-agent");
+  const parent = SessionManager.create(cwd, sessionDir);
+  parent.appendMessage({ role: "user", content: "parent turn", timestamp: Date.now() });
+  parent.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "parent reply" }],
+    api: "openai-completions",
+    provider: "test",
+    model: "test",
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  } as never);
+  const parentSessionFile = parent.getSessionFile();
+  assert.ok(parentSessionFile);
+  assert.equal(path.dirname(parentSessionFile!), sessionDir);
+  assert.ok(fs.existsSync(parentSessionFile!));
+
+  const child = createFreshChildSessionManager({ cwd, parentSessionFile: parentSessionFile! });
+  child.appendMessage({ role: "user", content: "child turn", timestamp: Date.now() });
+  child.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "child reply" }],
+    api: "openai-completions",
+    provider: "test",
+    model: "test",
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  } as never);
+  const childSessionFile = child.getSessionFile();
+  assert.ok(childSessionFile);
+  assert.equal(path.dirname(childSessionFile!), sessionDir);
+  assert.ok(fs.existsSync(childSessionFile!));
+  assert.notEqual(childSessionFile, parentSessionFile);
+
+  const header = JSON.parse(fs.readFileSync(childSessionFile!, "utf8").split("\n")[0]!);
+  assert.equal(header.type, "session");
+  assert.equal(header.parentSession, parentSessionFile);
+
+  const listed = await SessionManager.listAll(sessionDir);
+  assert.ok(listed.some(entry => entry.path === childSessionFile));
+});
+
+test("fork sessions remain in the parent catalogue with parentSession", async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fork-session-"));
+  const sessionDir = path.join(cwd, "sessions");
+  const taskDir = path.join(cwd, "task-artifacts");
+  fs.mkdirSync(taskDir, { recursive: true });
+  const { SessionManager } = await import("@earendil-works/pi-coding-agent");
+  const parent = SessionManager.create(cwd, sessionDir);
+  parent.appendMessage({ role: "user", content: "parent fork source", timestamp: Date.now() });
+  // Branch from an assistant leaf so createBranchedSession persists immediately.
+  const leaf = parent.appendMessage({
+    role: "assistant",
+    content: [{ type: "text", text: "parent durable reply" }],
+    api: "openai-completions",
+    provider: "test",
+    model: "test",
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  } as never);
+  const parentSessionFile = parent.getSessionFile();
+  assert.ok(parentSessionFile);
+  assert.ok(fs.existsSync(parentSessionFile!));
+  assert.ok(fs.readFileSync(parentSessionFile!, "utf8").includes(leaf));
+
+  const forked = await prepareForkSession({
+    parentSessionFile: parentSessionFile!,
+    parentLeafId: leaf,
+    cwd,
+  });
+  const forkedSessionFile = forked.getSessionFile();
+  assert.ok(forkedSessionFile);
+  assert.equal(path.dirname(forkedSessionFile!), sessionDir);
+  assert.ok(fs.existsSync(forkedSessionFile!));
+  assert.equal(fs.existsSync(path.join(taskDir, "session.jsonl")), false);
+
+  const header = JSON.parse(fs.readFileSync(forkedSessionFile!, "utf8").split("\n")[0]!);
+  assert.equal(header.type, "session");
+  assert.equal(header.parentSession, parentSessionFile);
+
+  const listed = await SessionManager.listAll(sessionDir);
+  assert.ok(listed.some(entry => entry.path === forkedSessionFile));
+});
+
 test("fork preparation rejects non-durable parent branch", async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fork-test-"));
   const sessionDir = path.join(cwd, "sessions");
@@ -353,7 +443,7 @@ test("fork preparation rejects non-durable parent branch", async () => {
   const headerPath = manager.getSessionFile();
   assert.ok(headerPath);
   await assert.rejects(
-    prepareForkSession({ parentSessionFile: headerPath!, parentLeafId: leaf, taskDir: path.join(cwd, "task"), cwd }),
+    prepareForkSession({ parentSessionFile: headerPath!, parentLeafId: leaf, cwd }),
     /not been durably written/,
   );
 });

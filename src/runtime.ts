@@ -171,10 +171,23 @@ export function isMutatingShellCommand(command: string): boolean {
   return !isReadOnlyShellCommand(command);
 }
 
+/** Create a Fresh child session in Pi's standard catalogue, linked to the parent when available. */
+export function createFreshChildSessionManager(options: {
+  cwd: string;
+  parentSessionFile?: string;
+}): SessionManager {
+  if (options.parentSessionFile) {
+    return SessionManager.create(options.cwd, path.dirname(options.parentSessionFile), {
+      parentSession: options.parentSessionFile,
+    });
+  }
+  // Fallback: still use Pi's default standard catalogue; parent linkage is unavailable.
+  return SessionManager.create(options.cwd);
+}
+
 export async function prepareForkSession(options: {
   parentSessionFile: string;
   parentLeafId: string;
-  taskDir: string;
   cwd: string;
 }): Promise<SessionManager> {
   if (!fs.existsSync(options.parentSessionFile)) {
@@ -195,10 +208,8 @@ export async function prepareForkSession(options: {
   if (!forked || !fs.existsSync(forked)) {
     throw new Error("unable to create persisted fork session; the selected parent branch has not been durably written yet");
   }
-  const childSessionFile = path.join(options.taskDir, "session.jsonl");
-  await fs.promises.mkdir(path.dirname(childSessionFile), { recursive: true });
-  await fs.promises.rename(forked, childSessionFile);
-  const sessionManager = SessionManager.open(childSessionFile, options.taskDir, options.cwd);
+  // Keep the branched file at its standard catalogue path (do not move into the task artifact dir).
+  const sessionManager = SessionManager.open(forked, path.dirname(forked), options.cwd);
   const branch = sessionManager.getBranch();
   const resolvedToolCalls = new Set(
     branch
@@ -838,11 +849,13 @@ async function makeChildSession(options: {
     sessionManager = await prepareForkSession({
       parentSessionFile: options.parent.parentSessionFile,
       parentLeafId: options.parent.parentLeafId,
-      taskDir: path.dirname(options.record.taskFile),
       cwd,
     });
   } else {
-    sessionManager = SessionManager.create(cwd, path.dirname(options.record.taskFile));
+    sessionManager = createFreshChildSessionManager({
+      cwd,
+      parentSessionFile: options.parent.parentSessionFile,
+    });
   }
 
   const frontmatterModel = options.spec.agent.model === "inherit" ? undefined : options.spec.agent.model;
@@ -1318,7 +1331,7 @@ export async function resumeCompletedTask(options: {
         })],
       });
       await loader.reload();
-      const sessionManager = SessionManager.open(sessionFile, path.dirname(options.record.taskFile), cwd);
+      const sessionManager = SessionManager.open(sessionFile, path.dirname(sessionFile), cwd);
       const resolved = options.record.model ? resolveCliModel({ cliModel: options.record.model, modelRuntime }) : undefined;
       const restoredTools = [...resumeTools];
       const resumeNestedTool = resumeTools.includes("Agent") && options.agents && options.parent?.taskQuota
