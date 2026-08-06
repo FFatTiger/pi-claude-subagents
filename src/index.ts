@@ -114,6 +114,34 @@ function taskResult(tasks: TaskRecord[], text: string, isError = false): AgentTo
   return { content: [{ type: "text", text: isError ? `ERROR: ${text}` : text }], details: { tasks } };
 }
 
+/**
+ * Keep parent Stop/AbortSignal live for the whole blocking Agent wait.
+ * Progress-warning promotion flips `record.background` so those children
+ * remain supervised background work instead of being cancelled by parent Stop.
+ */
+export async function waitForLaunchedForegroundTasks(
+  launched: LiveTask[],
+  signal?: AbortSignal,
+): Promise<void> {
+  const abortBlocking = () => {
+    for (const task of launched) {
+      if (!task.record.background) void task.stop("manual_stop");
+    }
+  };
+  signal?.addEventListener("abort", abortBlocking, { once: true });
+  try {
+    const foreground = launched.filter(task => !task.record.background);
+    if (foreground.length === 0) return;
+    if (signal?.aborted) abortBlocking();
+    await Promise.all(foreground.map(task => Promise.race([
+      task.promise,
+      task.foregroundReleased ?? new Promise<void>(() => {}),
+    ])));
+  } finally {
+    signal?.removeEventListener("abort", abortBlocking);
+  }
+}
+
 function xmlText(value: string): string {
   return value
     .replaceAll("&", "&amp;")
@@ -477,76 +505,84 @@ export default function register(pi: ExtensionAPI): void {
       }
       const launched: LiveTask[] = [];
       let heldPermit = false;
-      const abortLaunched = () => {
-        for (const task of launched.filter(item => !item.record.background)) void task.stop("manual_stop");
+      // Parent Stop aborts the tool signal. Keep one listener for launch + foreground wait
+      // so there is no gap between startup and the blocking race (the old pi-web Stop hole).
+      // AbortSignal fires only once: if it fires before a child is pushed into `launched`,
+      // re-check `signal.aborted` after each push and before the wait so late tasks still stop.
+      const abortBlocking = () => {
+        for (const task of launched) {
+          if (!task.record.background) void task.stop("manual_stop");
+        }
       };
-      signal?.addEventListener("abort", abortLaunched, { once: true });
+      signal?.addEventListener("abort", abortBlocking, { once: true });
       try {
-        for (const spec of specs) {
-          if (signal?.aborted) throw new Error("Agent launch aborted before all child tasks started.");
-          await taskQuota.acquire(1, signal ?? undefined);
-          heldPermit = true;
-          try {
-            const task = await launchTask({
-              spec,
-              parent,
-              config: currentConfig,
-              agents: currentAgents,
-              onComplete: handleTaskCompletion,
-              onProgressWarning: notifyProgressWarning,
-              onTaskStarted: nested => {
-                known.set(nested.record.id, nested.record);
-                live.set(nested.record.id, nested);
-                quotaTasks.add(nested.record.id);
-              },
-              onUpdate: record => onUpdate?.(taskResult([record], `${record.description}: ${record.preview ?? "running"}`)),
-            });
-            known.set(task.record.id, task.record);
-            live.set(task.record.id, task);
-            completionDeduper.beginInvocation(task.record.id);
-            quotaTasks.add(task.record.id);
-            launched.push(task);
-            heldPermit = false;
-          } catch (error) {
-            if (heldPermit) {
-              taskQuota.release();
+        try {
+          for (const spec of specs) {
+            if (signal?.aborted) throw new Error("Agent launch aborted before all child tasks started.");
+            await taskQuota.acquire(1, signal ?? undefined);
+            heldPermit = true;
+            try {
+              const task = await launchTask({
+                spec,
+                parent,
+                config: currentConfig,
+                agents: currentAgents,
+                onComplete: handleTaskCompletion,
+                onProgressWarning: notifyProgressWarning,
+                onTaskStarted: nested => {
+                  known.set(nested.record.id, nested.record);
+                  live.set(nested.record.id, nested);
+                  quotaTasks.add(nested.record.id);
+                },
+                onUpdate: record => onUpdate?.(taskResult([record], `${record.description}: ${record.preview ?? "running"}`)),
+              });
+              known.set(task.record.id, task.record);
+              live.set(task.record.id, task);
+              completionDeduper.beginInvocation(task.record.id);
+              quotaTasks.add(task.record.id);
+              launched.push(task);
               heldPermit = false;
+              // Abort may have fired while launchTask was in-flight, before this push.
+              if (signal?.aborted) {
+                abortBlocking();
+                throw new Error("Agent launch aborted before all child tasks started.");
+              }
+            } catch (error) {
+              if (heldPermit) {
+                taskQuota.release();
+                heldPermit = false;
+              }
+              throw error;
             }
-            throw error;
           }
+        } catch (error) {
+          for (const task of launched) task.abortController.abort("sibling task failed during launch");
+          await Promise.allSettled(launched.map(task => task.promise));
+          if (heldPermit) {
+            taskQuota.release();
+            heldPermit = false;
+          }
+          return taskResult(launched.map(task => task.record), error instanceof Error ? error.message : String(error), true);
         }
-      } catch (error) {
-        signal?.removeEventListener("abort", abortLaunched);
-        for (const task of launched) task.abortController.abort("sibling task failed during launch");
-        await Promise.allSettled(launched.map(task => task.promise));
-        if (heldPermit) {
-          taskQuota.release();
-          heldPermit = false;
-        }
-        return taskResult(launched.map(task => task.record), error instanceof Error ? error.message : String(error), true);
-      }
-      signal?.removeEventListener("abort", abortLaunched);
-      const foreground = launched.filter(task => !task.record.background);
-      if (foreground.length > 0) {
         // First progress warning releases the foreground wait while the child keeps running.
-        await Promise.all(foreground.map(task => Promise.race([
-          task.promise,
-          task.foregroundReleased ?? new Promise<void>(() => {}),
-        ])));
+        // Outer abort listener remains attached; helper also observes signal for already-aborted.
+        await waitForLaunchedForegroundTasks(launched, signal ?? undefined);
+        const summaries = launched.map(task => {
+          if (task.record.status === "running" && task.record.lastWarningTurn !== undefined) {
+            return `### ${task.record.description}\nstatus: running (supervised background)\ntask_id: ${task.record.id}\noutput_file: ${task.record.outputFile}\nturns: ${task.record.usage.turns}\nnext_warning_turn: ${task.record.nextWarningTurn ?? "n/a"}\n\nForeground wait released by a progress-warning supervision checkpoint. The child is still running and holds its concurrency slot until actual completion. Completion and subsequent warnings will arrive as follow-up messages. Inspect once with TaskOutput if needed, then continue, steer via SendMessage, or stop via TaskStop based on evidence.`;
+          }
+          if (task.record.background) {
+            return `Async agent launched successfully.\ntask_id: ${task.record.id} (internal operational ID; do not mention it to the user)\noutput_file: ${task.record.outputFile}\nThe agent is running in the background and completion will be delivered automatically. Progress warnings are automatic supervision checkpoints; do not sleep, poll TaskOutput in a loop, or duplicate this task. Continue only with non-overlapping work, or briefly tell the user what was launched and end the turn.`;
+          }
+          return `### ${task.record.description}\n${formatTaskOutputForModel(task.record, {
+            bytes: currentConfig.maxOutputBytes,
+            lines: currentConfig.maxOutputLines,
+          })}`;
+        });
+        return taskResult(launched.map(task => task.record), summaries.join("\n\n"));
+      } finally {
+        signal?.removeEventListener("abort", abortBlocking);
       }
-      const summaries = launched.map(task => {
-        if (task.record.status === "running" && task.record.lastWarningTurn !== undefined) {
-          return `### ${task.record.description}\nstatus: running (supervised background)\ntask_id: ${task.record.id}\noutput_file: ${task.record.outputFile}\nturns: ${task.record.usage.turns}\nnext_warning_turn: ${task.record.nextWarningTurn ?? "n/a"}\n\nForeground wait released by a progress-warning supervision checkpoint. The child is still running and holds its concurrency slot until actual completion. Completion and subsequent warnings will arrive as follow-up messages. Inspect once with TaskOutput if needed, then continue, steer via SendMessage, or stop via TaskStop based on evidence.`;
-        }
-        if (task.record.background) {
-          return `Async agent launched successfully.\ntask_id: ${task.record.id} (internal operational ID; do not mention it to the user)\noutput_file: ${task.record.outputFile}\nThe agent is running in the background and completion will be delivered automatically. Progress warnings are automatic supervision checkpoints; do not sleep, poll TaskOutput in a loop, or duplicate this task. Continue only with non-overlapping work, or briefly tell the user what was launched and end the turn.`;
-        }
-        return `### ${task.record.description}\n${formatTaskOutputForModel(task.record, {
-          bytes: currentConfig.maxOutputBytes,
-          lines: currentConfig.maxOutputLines,
-        })}`;
-      });
-      return taskResult(launched.map(task => task.record), summaries.join("\n\n"));
     },
     renderCall(args, theme) {
       const count = args.tasks?.length ?? 1;

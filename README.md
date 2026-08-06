@@ -16,10 +16,10 @@ Pick one install path:
 
 ```bash
 # npm
-pi install npm:pi-claude-subagents@0.3.2
+pi install npm:pi-claude-subagents@0.3.4
 
 # GitHub release
-pi install git:github.com/FFatTiger/pi-claude-subagents@v0.3.2
+pi install git:github.com/FFatTiger/pi-claude-subagents@v0.3.4
 
 # local checkout
 pi install /absolute/path/to/pi-claude-subagents

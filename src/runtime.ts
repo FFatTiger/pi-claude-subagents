@@ -754,7 +754,21 @@ export function createNestedAgentAdapter(options: NestedAgentAdapterOptions): To
           onUpdate: record => onUpdate?.({ content: [{ type: "text", text: `${record.description}: ${record.preview ?? "running"}` }], details: record }),
         });
         options.onTaskStarted?.(task);
-        await task.promise;
+        // Nested Agent is always foreground. Parent Stop must abort this wait, not hang on task.promise alone.
+        // Attach the listener before the aborted re-check so a Stop between launch and wait cannot be missed.
+        const stopNested = () => {
+          if (!task.record.background) void task.stop("manual_stop");
+        };
+        signal?.addEventListener("abort", stopNested, { once: true });
+        try {
+          if (signal?.aborted) stopNested();
+          await Promise.race([
+            task.promise,
+            task.foregroundReleased ?? new Promise<void>(() => {}),
+          ]);
+        } finally {
+          signal?.removeEventListener("abort", stopNested);
+        }
         return {
           content: [{ type: "text", text: formatTaskOutputForModel(task.record, {
             bytes: options.config.maxOutputBytes,

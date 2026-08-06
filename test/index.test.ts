@@ -3,8 +3,17 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import register, { AgentParams, TaskSpecSchema, createCompletionDeduper, formatTaskDiagnostic, inheritTaskWarningPolicy, progressWarningNotification, taskNotification } from "../src/index.ts";
-import type { TaskRecord } from "../src/tasks.ts";
+import register, {
+  AgentParams,
+  TaskSpecSchema,
+  createCompletionDeduper,
+  formatTaskDiagnostic,
+  inheritTaskWarningPolicy,
+  progressWarningNotification,
+  taskNotification,
+  waitForLaunchedForegroundTasks,
+} from "../src/index.ts";
+import type { LiveTask, TaskRecord } from "../src/tasks.ts";
 
 function partialTask(): TaskRecord {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-index-test-"));
@@ -126,4 +135,132 @@ test("task notification preserves partial status and detailed tool accounting", 
   assert.match(notification, /<tool_calls_requested>35<\/tool_calls_requested>/);
   assert.match(notification, /<tool_calls_executed>30<\/tool_calls_executed>/);
   assert.match(notification, /<tool_calls_blocked>5<\/tool_calls_blocked>/);
+});
+
+function mockLiveTask(options: {
+  background: boolean;
+  stop?: () => void;
+  settleMs?: number;
+  releaseMs?: number;
+}): LiveTask {
+  const settleMs = options.settleMs ?? 50;
+  let resolvePromise!: (record: TaskRecord) => void;
+  let resolveReleased!: () => void;
+  const record: TaskRecord = {
+    ...partialTask(),
+    status: "running",
+    background: options.background,
+    completedAt: undefined,
+  };
+  const promise = new Promise<TaskRecord>(resolve => {
+    resolvePromise = resolve;
+    if (options.releaseMs === undefined) {
+      setTimeout(() => resolve(record), settleMs);
+    }
+  });
+  const foregroundReleased = options.releaseMs === undefined
+    ? undefined
+    : new Promise<void>(resolve => {
+      resolveReleased = resolve;
+      setTimeout(() => {
+        record.background = true;
+        resolve();
+      }, options.releaseMs);
+    });
+  return {
+    record,
+    abortController: new AbortController(),
+    promise,
+    foregroundReleased,
+    send: async () => {},
+    stop: async () => {
+      options.stop?.();
+      record.status = "stopped";
+      record.terminationKind = "manual_stop";
+      record.error = "Stopped by parent.";
+      resolvePromise(record);
+      resolveReleased?.();
+    },
+  };
+}
+
+test("parent AbortSignal stops a blocked foreground Agent wait", async () => {
+  let stopped = 0;
+  const task = mockLiveTask({
+    background: false,
+    settleMs: 60_000,
+    stop: () => { stopped++; },
+  });
+  const controller = new AbortController();
+  const wait = waitForLaunchedForegroundTasks([task], controller.signal);
+  await Promise.resolve();
+  controller.abort();
+  await wait;
+  assert.equal(stopped, 1);
+  assert.equal(task.record.status, "stopped");
+});
+
+test("progress-promoted background children survive parent AbortSignal", async () => {
+  let stopped = 0;
+  const task = mockLiveTask({
+    background: false,
+    releaseMs: 5,
+    stop: () => { stopped++; },
+  });
+  const controller = new AbortController();
+  const wait = waitForLaunchedForegroundTasks([task], controller.signal);
+  await wait;
+  assert.equal(task.record.background, true);
+  controller.abort();
+  await Promise.resolve();
+  assert.equal(stopped, 0);
+  assert.equal(task.record.status, "running");
+});
+
+test("already-aborted signal stops foreground wait immediately", async () => {
+  let stopped = 0;
+  const task = mockLiveTask({
+    background: false,
+    settleMs: 60_000,
+    stop: () => { stopped++; },
+  });
+  const controller = new AbortController();
+  controller.abort();
+  await waitForLaunchedForegroundTasks([task], controller.signal);
+  assert.equal(stopped, 1);
+  assert.equal(task.record.status, "stopped");
+});
+
+test("abort during in-flight launch is recovered by post-push aborted recheck pattern", async () => {
+  // Models the production invariant: AbortSignal fires only once. If it fires while
+  // launchTask is awaited (before push), the listener may see an empty launched array.
+  // Production re-checks signal.aborted after push and calls abortBlocking again.
+  const launched: LiveTask[] = [];
+  let stopped = 0;
+  const controller = new AbortController();
+  const abortBlocking = () => {
+    for (const task of launched) {
+      if (!task.record.background) void task.stop("manual_stop");
+    }
+  };
+  controller.signal.addEventListener("abort", abortBlocking, { once: true });
+
+  // Abort before the child exists in `launched` (empty listener pass).
+  controller.abort();
+  abortBlocking(); // listener already ran with empty array
+  assert.equal(stopped, 0);
+
+  const task = mockLiveTask({
+    background: false,
+    settleMs: 60_000,
+    stop: () => { stopped++; },
+  });
+  launched.push(task);
+  // Post-push recovery — same check production performs after launchTask.
+  if (controller.signal.aborted) abortBlocking();
+  await waitForLaunchedForegroundTasks(launched, controller.signal);
+  // stop may be invoked more than once (post-push recovery + already-aborted wait helper);
+  // production stop is lifecycle-idempotent. Require at least one stop and terminal status.
+  assert.ok(stopped >= 1);
+  assert.equal(task.record.status, "stopped");
 });
