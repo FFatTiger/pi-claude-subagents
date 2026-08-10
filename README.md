@@ -157,8 +157,8 @@ readonly: true
 shellPolicy: verify
 background: true
 isolation: worktree
-warningTurns: 30
-warningIntervalTurns: 20
+warningTurns: 40
+warningIntervalTurns: 25
 maxTurns: 60
 graceTurns: 1
 maxToolCalls: 100
@@ -205,10 +205,13 @@ Runtime enforcement includes:
 - Shell policies: `inspect`, `verify`, `unrestricted`
 - Lifecycle phases: `starting → working → final_handoff → terminal`
 - Each root `Agent` invocation explicitly chooses positive `warning_turns` and `warning_interval_turns` for that task instead of copying a universal pair
-- Practical starting ranges: narrow/high-risk work `8–12 / 5–8`; routine investigation `15–25 / 8–12`; broad research `25–35 / 12–20`; multi-file implementation `30–45 / 15–25`; external or deployment work `10–15 / 5–10`
+- Default and general recommendation: `40 / 25` (first checkpoint / recurring interval)
+- Override only when scope or risk materially warrants it: narrow/high-risk `15–20 / 10–15`; routine investigation `30–40 / 20–25`; broad research `45–60 / 30–40`; multi-file implementation `50–70 / 35–45`; external/deployment `15–25 / 10–15`
 - In a `tasks` array, child entries inherit the top-level warning values unless their scope or risk materially differs
+- Long-running children are instructed to emit a one- or two-sentence stage note after meaningful phases and at least every 8–12 tool-using turns, giving the parent fresher visible progress without making supervision warnings frequent
 - Mandatory recurring progress supervision follows the chosen checkpoints
 - Warnings reach the root parent without stopping the child, restricting tools, or changing task status
+- A warning is not a failure, timeout, or proof of a stall; repeated/empty preview alone is insufficient reason to stop. Inspect once with `TaskOutput`, continue while turns/tool counters advance, and reserve `TaskStop` for explicit cancellation, dangerous/duplicate work, or repeated fresh evidence that useful progress stopped
 - A foreground task is promoted to supervised background execution on its first warning so the parent can inspect, steer, or stop it
 - Optional soft `maxTurns` + grace window for explicit unattended policy (default grace 1)
 - Optional hard `maxToolCalls` that blocks only configured tools (default `read`, `grep`, `find`, `ls`)
@@ -248,8 +251,8 @@ Trusted project:
   "defaultMaxToolCalls": null,
   "defaultSoftToolCalls": null,
   "defaultToolBudgetBlock": ["read", "grep", "find", "ls"],
-  "warningTurns": 30,
-  "warningIntervalTurns": 20,
+  "warningTurns": 40,
+  "warningIntervalTurns": 25,
   "maxOutputBytes": 204800,
   "maxOutputLines": 5000,
   "maxTasksPerLaunch": 8,
@@ -265,7 +268,7 @@ Trusted project:
 }
 ```
 
-The public `Agent` schema requires `warning_turns` and `warning_interval_turns` on every root call. The caller chooses them from task scope, uncertainty, drift/stall risk, tool cost, external waiting, and visibility of intermediate progress; it should not reuse one universal pair across unrelated tasks. Tasks-array entries inherit top-level values unless their risk materially differs. Runtime defaults remain an internal fallback for invalid persisted/config values and legacy records, not a recommendation shown to the calling model. Defaults leave hard timeout, turn, tool, and cleanup budgets unset. Positive `cleanupPeriodDays` enables age-based retention cleanup. Legacy `maxOutputChars` still maps to `maxOutputBytes`. Bundled roles declare no hard budgets; custom frontmatter and runtime config can still define advanced unattended policies.
+The public `Agent` schema requires `warning_turns` and `warning_interval_turns` on every root call. The runtime fallback and general recommendation are `40 / 25`. The caller should override that pair only when task scope, uncertainty, drift/stall risk, tool cost, or external waiting materially warrants one of the documented ranges. Tasks-array entries inherit top-level values unless their risk materially differs. Warnings are supervision checkpoints rather than timeout signals, and children emit more frequent concise stage notes independently of the warning schedule. Defaults leave hard timeout, turn, tool, and cleanup budgets unset. Positive `cleanupPeriodDays` enables age-based retention cleanup. Legacy `maxOutputChars` still maps to `maxOutputBytes`. Bundled roles declare no hard budgets; custom frontmatter and runtime config can still define advanced unattended policies.
 
 ## Persistence
 

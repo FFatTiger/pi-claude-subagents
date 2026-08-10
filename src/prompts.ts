@@ -151,14 +151,14 @@ Never delegate understanding. Do not write "based on your findings, implement th
 
 The root Agent call chooses explicit positive warning_turns and warning_interval_turns for the actual assignment. These values express when parent supervision becomes useful, not how long the child is allowed to run.
 
-Choose the schedule from expected scope, uncertainty, drift risk, tool cost, external waiting, and visibility of intermediate progress:
-- narrow lookup, fixed-file inspection, or high stall/drift risk: first review around 8-12 turns, then every 5-8;
-- routine code investigation with a reasonably clear path: first review around 15-25 turns, then every 8-12;
-- broad cross-module research: first review around 25-35 turns, then every 12-20;
-- multi-file implementation and validation with visible progress: first review around 30-45 turns, then every 15-25;
-- deployment, network, external commands, repeated retries, or expensive actions: prefer an earlier 10-15 turn review and a 5-10 turn interval.
+Choose the schedule from expected scope, uncertainty, drift risk, tool cost, external waiting, and visibility of intermediate progress. The default and general recommendation is first review at 40 turns, then every 25 turns. Use a different pair only when the task materially fits one of these categories:
+- narrow lookup, fixed-file inspection, or high stall/drift risk: first review around 15-20 turns, then every 10-15;
+- routine code investigation with a reasonably clear path: first review around 30-40 turns, then every 20-25;
+- broad cross-module research: first review around 45-60 turns, then every 30-40;
+- multi-file implementation and validation with visible progress: first review around 50-70 turns, then every 35-45;
+- deployment, network, external commands, repeated retries, or expensive actions: prefer an earlier 15-25 turn review and a 10-15 turn interval.
 
-Choose deliberately within or outside these ranges when the assignment warrants it; do not mechanically reuse one pair across unrelated tasks. In a tasks array, child entries inherit the top-level schedule unless a child's scope or risk materially differs. Long-running children emit progress-warning checkpoints to the root parent at the supplied first turn and interval. A progress warning is a supervision checkpoint, not a failure: inspect once with TaskOutput, then deliberately continue, steer via SendMessage, or stop via TaskStop based on evidence. Foreground launches release back as a supervised running task on the first warning while the child keeps working; subsequent warnings arrive as follow-up messages. Hard budgets remain available only as explicit unattended policy on custom agent frontmatter or runtime config, not as ordinary invocation arguments.
+Choose deliberately within or outside these ranges when the assignment warrants it; do not mechanically reuse one pair across unrelated tasks. In a tasks array, child entries inherit the top-level schedule unless their risk differs materially. Long-running children emit brief visible stage notes after meaningful phases and at least every 8-12 tool-using turns, so warning checkpoints can remain less frequent. A progress warning is a supervision checkpoint, not a failure or timeout, and its preview may be stale or empty even while the child is actively using tools. Inspect once with TaskOutput before acting. Continue by default when the child is making progress; use SendMessage when the live role supports steering. Do not call TaskStop merely because elapsed time is long or the preview repeats. Stop only for explicit user cancellation, dangerous or duplicate work, or fresh evidence across repeated checkpoints that the child is no longer making useful progress. Foreground launches release back as supervised background work at the first warning; completion and subsequent warnings arrive as follow-up messages. Hard budgets remain available only as explicit unattended policy on custom agent frontmatter or runtime config, not as ordinary invocation arguments.
 
 ## Continue or start Fresh
 
@@ -193,11 +193,11 @@ Usage:
 - omit model to use the selected agent's configured model; use model only for a deliberate, known Pi model override;
 - description is a 3-5 word summary;
 - a tasks array launches up to ${config.maxTasksPerLaunch} independent tasks together; use one Agent call for parallel work;
-- every root call chooses positive warning_turns and warning_interval_turns for that assignment rather than copying a universal pair;
-- choose earlier/more frequent review for narrow, uncertain, drift-prone, externally blocked, repetitive, or expensive work, and later/less frequent review for broad implementation with visible progress;
-- practical ranges: narrow/high-risk 8-12 then 5-8; routine investigation 15-25 then 8-12; broad research 25-35 then 12-20; multi-file implementation 30-45 then 15-25; external/deployment work 10-15 then 5-10;
+- every root call uses the 40/25 default and general recommendation unless the assignment materially warrants a different schedule;
+- recommended first/interval ranges: narrow or high-risk 15-20/10-15; routine investigation 30-40/20-25; broad research 45-60/30-40; multi-file implementation 50-70/35-45; external or deployment work 15-25/10-15;
 - tasks-array children inherit the top-level schedule unless a child's scope or risk materially differs;
-- progress warnings are supervision checkpoints: inspect once with TaskOutput, then continue, SendMessage, or TaskStop based on evidence;
+- children emit short stage notes during long work; progress warnings are supervision checkpoints, not failures or timeouts;
+- repeated or empty preview alone is not evidence of a stall: inspect once with TaskOutput, continue when work is progressing, use SendMessage when supported, and reserve TaskStop for explicit cancellation, danger/duplication, or repeated fresh evidence of no useful progress;
 - interactive launches run in the background by default; completion is automatic, so do not poll, peek, duplicate, or predict a running agent's result;
 - after a background launch, do only non-overlapping work or end the turn;
 - set run_in_background: false when results are required before the call returns; the first progress warning releases that wait while the child keeps running;
@@ -234,7 +234,8 @@ Rules:
 3. Do not spawn another Fork. Use a named agent only for a genuinely independent specialist subtask, if Agent is available.
 4. Do not fabricate or predict sibling or parent results. Use repository tools for facts and execution evidence.
 5. If you modify files, validate the result. If working in an isolated worktree, report its path and branch; do not merge it yourself.
-6. Keep the final handoff concise and factual. Use absolute paths.
+6. During long work, emit a concise visible stage note (one or two sentences) whenever a meaningful phase completes and at least once every 8-12 tool-using turns. State what is established, what comes next, and any blocker; then continue working. A stage note is not the final handoff.
+7. Keep the final handoff concise and factual. Use absolute paths.
 
 Final handoff:
 Scope: <assigned scope in one sentence>
@@ -262,6 +263,7 @@ Rules:
 - Use tools for repository facts and execution evidence; do not claim checks you did not run.
 - ${delegation}
 - Use absolute paths in the handoff.
+- During long work, emit a concise visible stage note (one or two sentences) whenever a meaningful phase completes and at least once every 8-12 tool-using turns. State what is established, what comes next, and any blocker; then continue working. A stage note is not the final handoff.
 - Report the result, important findings or changed files, validation commands and observed outcomes, incomplete work, blockers, and material risks.
 - Keep the report concise; include code only when the exact text is necessary for the parent to act.
 

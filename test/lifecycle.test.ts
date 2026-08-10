@@ -10,8 +10,8 @@ import {
 
 test("mandatory warning schedule falls back to safe positive defaults", () => {
   assert.deepEqual(resolveWarningSchedule({ warningTurns: null, warningIntervalTurns: 0 }), {
-    warningTurns: 30,
-    warningIntervalTurns: 20,
+    warningTurns: 40,
+    warningIntervalTurns: 25,
   });
   assert.deepEqual(resolveWarningSchedule({ warningTurns: 12, warningIntervalTurns: 7 }), {
     warningTurns: 12,
@@ -85,7 +85,7 @@ test("unconfigured lifecycle has no turn or tool budget and keeps mandatory supe
     if (completion.progressWarning) warningTurns.push(completion.progressWarning.turn);
   }
 
-  assert.deepEqual(warningTurns, [30, 50, 70, 90]);
+  assert.deepEqual(warningTurns, [40, 65, 90]);
   assert.equal(lifecycle.snapshot.usage.turns, 100);
   assert.equal(lifecycle.snapshot.usage.toolCallsExecuted, 100);
   assert.equal(lifecycle.snapshot.toolBudgetExhausted, false);

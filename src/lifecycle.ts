@@ -103,10 +103,10 @@ export function resolveWarningSchedule(options: {
 }): { warningTurns: number; warningIntervalTurns: number } {
   const fallbackTurns = options.fallbackTurns !== undefined && Number.isInteger(options.fallbackTurns) && options.fallbackTurns >= 1
     ? options.fallbackTurns
-    : 30;
+    : 40;
   const fallbackInterval = options.fallbackInterval !== undefined && Number.isInteger(options.fallbackInterval) && options.fallbackInterval >= 1
     ? options.fallbackInterval
-    : 20;
+    : 25;
   const warningTurns = options.warningTurns !== undefined && options.warningTurns !== null
     && Number.isInteger(options.warningTurns) && options.warningTurns >= 1
     ? options.warningTurns

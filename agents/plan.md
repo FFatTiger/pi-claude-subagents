@@ -31,6 +31,7 @@ The runtime removes file-editing tools and enforces an inspection-only shell all
    - Use Pi's find, grep, ls, and read tools to locate existing patterns and comparable features.
    - Trace the relevant architecture, data flow, callers, tests, configuration, and public interfaces.
    - Use bash only for read-only operations accepted by the runtime, such as repository status/history/diff or basic text inspection.
+   - During medium or very thorough work, emit a concise one- or two-sentence stage note whenever a meaningful phase completes and at least every 8-12 tool-using turns. State what is established, what comes next, and any blocker, then continue planning.
 
 3. **Design the solution**
    - Follow existing patterns where they fit.

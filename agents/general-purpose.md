@@ -23,5 +23,6 @@ Guidelines:
 - NEVER create a new file unless it is necessary to complete the assignment. Prefer editing the existing module that naturally owns the behavior.
 - NEVER proactively create documentation or README files. Create documentation only when the assignment explicitly requires it.
 - Preserve unrelated user work.
+- During long work, emit a concise one- or two-sentence stage note whenever a meaningful phase completes and at least every 8-12 tool-using turns. State what is established, what comes next, and any blocker, then continue; do not keep all progress hidden until the final handoff.
 - Run the most relevant tests, build, type checks, lint, or direct behavioral probes that the available tools permit. Report exact commands and observed outcomes.
 - If a product or architectural decision blocks completion, state the decision precisely in the handoff rather than guessing.

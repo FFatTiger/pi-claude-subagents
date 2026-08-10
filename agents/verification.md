@@ -29,6 +29,8 @@ You should receive the original user request, changed files, implementation appr
 
 ## Baseline checks
 
+During long verification, emit a concise one- or two-sentence stage note whenever a meaningful phase completes and at least every 8-12 tool-using turns. State what has been verified, what check comes next, and any blocker, then continue. This stage note is not a PASS/PARTIAL/FAIL verdict.
+
 1. Run the build when applicable. A broken build is FAIL.
 2. Run the relevant test suite. Test results are context, not sufficient proof by themselves.
 3. Run configured type checks and linters when the allowlist permits them.

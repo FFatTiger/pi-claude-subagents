@@ -56,8 +56,8 @@ export const AgentParams = Type.Object({
   isolation: Type.Optional(StringEnum(["none", "worktree"] as const, { description: "Optional task isolation. Use none unless worktree isolation is explicitly required." })),
   cwd: Type.Optional(Type.String()),
   name: Type.Optional(Type.String()),
-  warning_turns: Type.Integer({ minimum: 1, description: "Required first supervision checkpoint, chosen for this task. Use 8-12 for narrow or high-stall-risk work, 15-25 for routine investigation, and 30-45 for broad implementation or validation with visible progress." }),
-  warning_interval_turns: Type.Integer({ minimum: 1, description: "Required reassessment interval, chosen for this task. Use 5-10 when drift, repetition, external waits, or expensive actions need close review; 10-15 for routine work; 15-25 for productive long-running implementation." }),
+  warning_turns: Type.Integer({ minimum: 1, default: 40, description: "Required first supervision checkpoint. Default and general recommendation: 40 turns. Use 15-20 for narrow/high-risk work, 30-40 for routine investigation, 45-60 for broad research, 50-70 for multi-file implementation, and 15-25 for external/deployment work." }),
+  warning_interval_turns: Type.Integer({ minimum: 1, default: 25, description: "Required reassessment interval. Default and general recommendation: 25 turns. Use 10-15 for narrow/high-risk work, 20-25 for routine investigation, 30-40 for broad research, 35-45 for multi-file implementation, and 10-15 for external/deployment work." }),
   tasks: Type.Optional(Type.Array(TaskSpecSchema)),
 });
 
@@ -223,7 +223,7 @@ export function progressWarningNotification(record: TaskRecord, details: {
     `<usage><turns>${usage.turns}</turns><tool_calls_requested>${usage.toolCallsRequested}</tool_calls_requested><tool_calls_executed>${usage.toolCallsExecuted}</tool_calls_executed><tool_calls_blocked>${usage.toolCallsBlocked}</tool_calls_blocked></usage>`,
     `<elapsed_seconds>${elapsedSec}</elapsed_seconds>`,
     `<preview>${xmlText(preview)}</preview>`,
-    "<guidance>Progress warning is a supervision checkpoint, not a failure. Inspect once with TaskOutput, then continue, steer via SendMessage, or stop via TaskStop based on evidence. Do not poll in a loop.</guidance>",
+    "<guidance>This is a scheduled supervision checkpoint, not a failure, timeout, or proof of a stall. The preview can be stale or empty while the child is actively thinking or using tools. Inspect current state once with TaskOutput before acting. Continue by default when turns or tool counters are advancing. Use SendMessage when the live role supports steering. Do not call TaskStop merely because elapsed time is long or the preview repeats; stop only for explicit user cancellation, dangerous or duplicate work, or fresh evidence across repeated checkpoints that useful progress has stopped. Do not poll in a loop.</guidance>",
     "</progress-warning>",
   ].filter(Boolean).join("\n");
 }
@@ -475,7 +475,7 @@ export default function register(pi: ExtensionAPI): void {
       "Delegate implementation needing more than a couple of edits, isolation, broad validation, or substantial intermediate tool output unless it is tightly scoped and direct execution is clearly cheaper.",
       "Named agents start Fresh. Explain the goal and why, known evidence and ruled-out paths, exact files/errors, scope, success criteria, validation, and expected response. Never delegate understanding: synthesize research into concrete implementation instructions.",
       "In interactive Pi, Agent launches in the background by default. Do not poll, peek, duplicate, or predict the result. Continue only non-overlapping work, or briefly state what is running and end the turn.",
-      "Use subagent_type: fork only for root-session work that needs the persisted conversation and decisions. Every root call chooses positive warning_turns and warning_interval_turns for the actual assignment: earlier and more frequent review for narrow, drift-prone, externally blocked, or expensive work; later and less frequent review for broad implementation with visible progress. Tasks-array children inherit the top-level policy unless their risk differs materially. Progress warnings are supervision checkpoints: inspect once with TaskOutput, then continue, SendMessage, or TaskStop based on evidence.",
+      "Use subagent_type: fork only for root-session work that needs the persisted conversation and decisions. The default and general warning schedule is 40 turns first, then every 25 turns; choose a different pair only when the assignment materially fits the documented scope/risk ranges. Tasks-array children inherit the top-level policy unless their risk differs materially. Children emit short stage notes during long work. A progress warning is not a failure or timeout, and repeated/empty preview alone is not a stall signal: inspect once with TaskOutput, continue when counters advance, use SendMessage when supported, and reserve TaskStop for explicit cancellation, danger/duplication, or repeated fresh evidence of no useful progress.",
     ],
     description: buildAgentToolDescription(currentAgents, currentConfig),
     parameters: AgentParams,
@@ -569,7 +569,7 @@ export default function register(pi: ExtensionAPI): void {
         await waitForLaunchedForegroundTasks(launched, signal ?? undefined);
         const summaries = launched.map(task => {
           if (task.record.status === "running" && task.record.lastWarningTurn !== undefined) {
-            return `### ${task.record.description}\nstatus: running (supervised background)\ntask_id: ${task.record.id}\noutput_file: ${task.record.outputFile}\nturns: ${task.record.usage.turns}\nnext_warning_turn: ${task.record.nextWarningTurn ?? "n/a"}\n\nForeground wait released by a progress-warning supervision checkpoint. The child is still running and holds its concurrency slot until actual completion. Completion and subsequent warnings will arrive as follow-up messages. Inspect once with TaskOutput if needed, then continue, steer via SendMessage, or stop via TaskStop based on evidence.`;
+            return `### ${task.record.description}\nstatus: running (supervised background)\ntask_id: ${task.record.id}\noutput_file: ${task.record.outputFile}\nturns: ${task.record.usage.turns}\nnext_warning_turn: ${task.record.nextWarningTurn ?? "n/a"}\n\nForeground wait released by a scheduled supervision checkpoint. The child is still running and holds its concurrency slot until actual completion. This is not a timeout or failure; a repeated or empty preview can coexist with active thinking/tool work. Completion and subsequent checkpoints arrive as follow-up messages. Inspect once with TaskOutput if needed, continue by default while counters advance, use SendMessage when supported, and reserve TaskStop for explicit cancellation, danger/duplication, or repeated fresh evidence that useful progress has stopped.`;
           }
           if (task.record.background) {
             return `Async agent launched successfully.\ntask_id: ${task.record.id} (internal operational ID; do not mention it to the user)\noutput_file: ${task.record.outputFile}\nThe agent is running in the background and completion will be delivered automatically. Progress warnings are automatic supervision checkpoints; do not sleep, poll TaskOutput in a loop, or duplicate this task. Continue only with non-overlapping work, or briefly tell the user what was launched and end the turn.`;

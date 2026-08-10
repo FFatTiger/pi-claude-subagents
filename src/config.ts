@@ -42,8 +42,8 @@ export interface PiSubagentsConfig {
   cleanupPeriodDays?: number;
 }
 
-export const DEFAULT_WARNING_TURNS = 30;
-export const DEFAULT_WARNING_INTERVAL_TURNS = 20;
+export const DEFAULT_WARNING_TURNS = 40;
+export const DEFAULT_WARNING_INTERVAL_TURNS = 25;
 
 export const DEFAULT_CONFIG: PiSubagentsConfig = {
   maxConcurrentTasks: 20,

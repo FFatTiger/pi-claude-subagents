@@ -108,8 +108,8 @@ test("runtime defaults leave budgets and cleanup unset", () => {
   assert.equal(DEFAULT_CONFIG.defaultMaxToolCalls, undefined);
   assert.equal(DEFAULT_CONFIG.defaultSoftToolCalls, undefined);
   assert.deepEqual(DEFAULT_CONFIG.defaultToolBudgetBlock, ["read", "grep", "find", "ls"]);
-  assert.equal(DEFAULT_CONFIG.warningTurns, 30);
-  assert.equal(DEFAULT_CONFIG.warningIntervalTurns, 20);
+  assert.equal(DEFAULT_CONFIG.warningTurns, 40);
+  assert.equal(DEFAULT_CONFIG.warningIntervalTurns, 25);
   assert.equal(DEFAULT_CONFIG.maxOutputBytes, 200 * 1024);
   assert.equal(DEFAULT_CONFIG.maxOutputLines, 5000);
   assert.equal(DEFAULT_CONFIG.cleanupPeriodDays, undefined);
