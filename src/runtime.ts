@@ -45,9 +45,81 @@ function escapeXml(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
+function stripQuotedSpans(command: string): string {
+  let out = "";
+  let quote: "'" | '"' | undefined;
+  for (const char of command) {
+    if (quote) {
+      if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+    out += char;
+  }
+  return out;
+}
+
+/** Allow `>/dev/null`, `2>/dev/null`, `2>&1`, `</dev/null`, `<&-` redirections only. */
+function hasOnlyNullRedirections(command: string): boolean {
+  const unquoted = stripQuotedSpans(command);
+  const stripped = unquoted
+    .replace(/[012]?>>?\s*\/dev\/null/g, "")
+    .replace(/[012]?>\s*&[12]/g, "")
+    .replace(/[012]?<\s*\/dev\/null/g, "")
+    .replace(/[012]?<\s*&-/g, "");
+  return !/[<>]/.test(stripped);
+}
+
 function shellSegments(command: string): string[] | null {
-  if (!command.trim() || /[><`{}$*?\[]/.test(command)) return null;
-  return command.split(/\s*(?:&&|\|\||;|\||&|\r?\n)\s*/).filter(Boolean);
+  if (!command.trim()) return null;
+  // Command substitution is the only metacharacter form that can run arbitrary code
+  // inside an otherwise allowlisted command; globs and braces are safe because the
+  // per-segment program allowlist is the real gate.
+  if (/[`]/.test(command) || /\$\(/.test(command)) return null;
+  if (!hasOnlyNullRedirections(command)) return null;
+  const segments: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | undefined;
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (quote) {
+      current += char;
+      if (char === quote) quote = undefined;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      current += char;
+      continue;
+    }
+    if (char === "\n" || char === ";" || char === "|") {
+      if (current.trim()) segments.push(current.trim());
+      current = "";
+      continue;
+    }
+    if (char === "&") {
+      // `&&` joins commands; a bare `&` backgrounds; `2>&1`/`&1` are redirections.
+      if (command[i + 1] === "&") {
+        if (current.trim()) segments.push(current.trim());
+        current = "";
+        i++;
+        continue;
+      }
+      if (/[0-9]/.test(command[i + 1] ?? "")) {
+        current += char;
+        continue;
+      }
+      if (current.trim()) segments.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  if (current.trim()) segments.push(current.trim());
+  return segments.length > 0 ? segments : null;
 }
 
 function commandWords(segment: string): string[] | null {
@@ -85,7 +157,9 @@ function commandWords(segment: string): string[] | null {
   }
   if (escaping || quote) return null;
   if (word) words.push(word);
-  if (words.some(item => /^[A-Za-z_][A-Za-z0-9_]*=/.test(item))) return null;
+  // An environment-assignment prefix (`FOO=bar cmd`) is the only mutating form;
+  // `echo "x=$y"`-style `name=value` arguments are harmless output.
+  if (words.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!)) return null;
   return words;
 }
 
@@ -95,7 +169,6 @@ function hasDangerousGitOption(words: string[], segment: string): boolean {
     word === "--ext-diff"
     || word === "--textconv"
     || word === "--paginate"
-    || word === "-p"
     || word === "--config-env"
     || word === "--exec-path"
     || word === "--open-files-in-pager"
@@ -113,21 +186,59 @@ function hasDangerousInspectionOption(program: string, words: string[]): boolean
   return false;
 }
 
+const GIT_READ_SUBCOMMANDS = new Set([
+  "diff", "show", "log", "cat-file", "ls-tree", "diff-tree", "grep", "describe", "blame",
+  "show-ref", "fsck", "merge-base", "rev-list", "name-rev", "count-objects",
+]);
+const GIT_SAFE_BRANCH_FLAGS = new Set([
+  "-a", "--all", "-r", "--remotes", "-v", "-vv", "--show-current", "--list", "--merged", "--no-merged", "--contains",
+]);
+const GIT_SAFE_TAG_FLAGS = new Set([
+  "-l", "--list", "--merged", "--no-merged", "--contains", "--points-at", "--sort", "--format",
+]);
+const VERSION_QUERY_PROGRAMS = new Set([
+  "node", "npm", "pnpm", "yarn", "bun", "npx", "python3", "python", "ruby", "perl", "go",
+  "cargo", "rustc", "git", "docker", "docker-compose", "tsc", "gcc", "clang", "java", "make",
+]);
+const VERSION_FLAGS = new Set(["-v", "-V", "--version", "version"]);
+
+function isSafeGit(words: string[], segment: string): boolean {
+  const subcommand = words[1];
+  if (subcommand === "status" || subcommand === "rev-parse" || subcommand === "ls-files" || subcommand === "check-ignore") return true;
+  if (subcommand === "branch") return words.slice(2).every(arg => GIT_SAFE_BRANCH_FLAGS.has(arg));
+  if (subcommand === "tag") return words.slice(2).every(arg => GIT_SAFE_TAG_FLAGS.has(arg));
+  if (GIT_READ_SUBCOMMANDS.has(subcommand)) return !hasDangerousGitOption(words, segment);
+  return false;
+}
+
+function isSafeSed(words: string[]): boolean {
+  const args = words.slice(1);
+  // Only `sed -n` printing/range reads are safe: `-i` edits in place, `-e`/`-f`
+  // add script inputs, and `w`/`s///w` commands write files.
+  if (!args.includes("-n") && !args.includes("--quiet") && !args.includes("--silent")) return false;
+  if (args.some(arg => arg === "-i" || arg === "-e" || arg === "-f" || arg === "--in-place" || arg === "--expression" || arg === "--file" || arg.startsWith("-i"))) return false;
+  const expression = args.find(arg => !arg.startsWith("-"));
+  if (!expression) return false;
+  if (!/^[0-9,\s;pd!=~$]*$/.test(expression)) return false;
+  return true;
+}
+
 function isInspectionSegment(segment: string): boolean {
   const words = commandWords(segment);
   if (!words) return false;
   const program = words[0];
   if (!program) return false;
   if (program === "pwd") return words.length === 1;
+  if (program === "cd" || program === "echo") return true;
   if (program === "ls") return !words.slice(1).some(word => word.startsWith("--quoting-style") || word === "--hyperlink" || word.startsWith("--hyperlink="));
   if (["cat", "head", "tail", "wc", "cut", "stat", "du", "grep"].includes(program)) return true;
+  if (program === "rg") return !hasDangerousInspectionOption(program, words);
   if (program === "uniq") return words.length <= 2;
-  if (program === "git") {
-    const subcommand = words[1];
-    return subcommand === "status" || subcommand === "rev-parse" || subcommand === "ls-files" || (subcommand === "branch" && words.length === 3 && words[2] === "--show-current");
-  }
+  if (program === "sed") return isSafeSed(words);
+  if (program === "git") return isSafeGit(words, segment);
   if (program === "sort") return words.length === 1;
   if (program === "find") return !words.some(word => /^-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/.test(word));
+  if (VERSION_QUERY_PROGRAMS.has(program)) return words.length === 2 && VERSION_FLAGS.has(words[1]);
   return false;
 }
 
@@ -143,7 +254,7 @@ function isVerificationSegment(segment: string): boolean {
       return args.length === 2 && args[1] === "--dry-run";
     }
     const script = program === "yarn" ? args[0] : args[0] === "run" ? args[1] : args[0];
-    return Boolean(script && /^(?:test|check|typecheck|lint|build)(?::[\w.-]+)?$/.test(script));
+    return Boolean(script && /^(?:[\w.-]+:)?(?:test|check|typecheck|lint|build)(?::[\w.-]+)?$/.test(script));
   }
   if (program === "npx") return args[0] === "tsc" && args.includes("--noEmit");
   if (program === "tsc") return args.includes("--noEmit");

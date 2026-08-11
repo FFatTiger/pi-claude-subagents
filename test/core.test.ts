@@ -339,6 +339,73 @@ test("read-only shell guard blocks mutations", () => {
   assert.equal(isMutatingShellCommand("rm -rf build"), true);
 });
 
+test("read-only shell guard accepts expanded inspection commands", () => {
+  // Previously-blocked read-only git subcommands.
+  assert.equal(isReadOnlyShellCommand("git log --oneline --decorate -12"), true);
+  assert.equal(isReadOnlyShellCommand("git show --stat --oneline 6af6425"), true);
+  assert.equal(isReadOnlyShellCommand("git diff HEAD --stat"), true);
+  assert.equal(isReadOnlyShellCommand("git diff --check"), true);
+  assert.equal(isReadOnlyShellCommand("git diff --cached"), true);
+  assert.equal(isReadOnlyShellCommand("git diff --name-only 6af6425^ 6af6425"), true);
+  assert.equal(isReadOnlyShellCommand("git cat-file -p 8a32502 | head -20"), true);
+  assert.equal(isReadOnlyShellCommand("git diff-tree -r --stat 8a32502"), true);
+  assert.equal(isReadOnlyShellCommand("git ls-tree --name-only HEAD"), true);
+  assert.equal(isReadOnlyShellCommand("git check-ignore -v node_modules/.bin/eslint"), true);
+  assert.equal(isReadOnlyShellCommand("git log -1 --format=%B 8a32502"), true);
+  assert.equal(isReadOnlyShellCommand("git show 8a32502:package.json | head -5"), true);
+  assert.equal(isReadOnlyShellCommand("git tag --list"), true);
+  assert.equal(isReadOnlyShellCommand("git tag"), true);
+  assert.equal(isReadOnlyShellCommand("git branch -a"), true);
+  // git commands that write still stay blocked.
+  assert.equal(isReadOnlyShellCommand("git tag v1.0"), false);
+  assert.equal(isReadOnlyShellCommand("git branch new-branch"), false);
+  assert.equal(isReadOnlyShellCommand("git diff --output=/tmp/x"), false);
+  assert.equal(isReadOnlyShellCommand("git diff --ext-diff"), false);
+  assert.equal(isReadOnlyShellCommand("git reset --hard HEAD"), false);
+  assert.equal(isReadOnlyShellCommand("git checkout main"), false);
+  assert.equal(isReadOnlyShellCommand("git push origin main"), false);
+  // cd/echo with fallback patterns; echo writes are still blocked by redirection.
+  assert.equal(isReadOnlyShellCommand("cd repo && git status && git log --oneline -5"), true);
+  assert.equal(isReadOnlyShellCommand("git diff HEAD --stat 2>/dev/null || echo \"parent-not-found\""), true);
+  assert.equal(isReadOnlyShellCommand("echo hi > file.txt"), false);
+  // Globs, redirections to /dev/null, pipes inside quotes, and range reads.
+  assert.equal(isReadOnlyShellCommand("ls *.tgz"), true);
+  assert.equal(isReadOnlyShellCommand("git log --oneline 2>/dev/null | head -5"), true);
+  assert.equal(isReadOnlyShellCommand("git rev-parse main:tsconfig.json 2>&1"), true);
+  assert.equal(isReadOnlyShellCommand("grep -rn 'NODE_ENV' AGENTS.md 2>/dev/null | head -20"), true);
+  assert.equal(isReadOnlyShellCommand("grep -iE 'tgz|packages' file.txt"), true);
+  assert.equal(isReadOnlyShellCommand("find . -maxdepth 3 -type f \\( -name '*.yml' -o -name '*.yaml' \\) | sort"), true);
+  assert.equal(isReadOnlyShellCommand("sed -n '630,680p' /var/log/build.log"), true);
+  assert.equal(isReadOnlyShellCommand("cat a b > out.txt"), false);
+  assert.equal(isReadOnlyShellCommand("cat a 2>/dev/null"), true);
+  assert.equal(isReadOnlyShellCommand("sed -i 's/a/b/' file"), false);
+  assert.equal(isReadOnlyShellCommand("sed -n '1,5w /tmp/out' file"), false);
+  // Version queries are allowed; code execution stays blocked.
+  assert.equal(isReadOnlyShellCommand("node -v"), true);
+  assert.equal(isReadOnlyShellCommand("node --version"), true);
+  assert.equal(isReadOnlyShellCommand("npm -v"), true);
+  assert.equal(isReadOnlyShellCommand("python3 -V"), true);
+  assert.equal(isReadOnlyShellCommand("ruby -v"), true);
+  assert.equal(isReadOnlyShellCommand("node -e 'console.log(1)'"), false);
+  assert.equal(isReadOnlyShellCommand("python3 -c 'print(1)'"), false);
+  assert.equal(isReadOnlyShellCommand("perl -e 'print $^V'"), false);
+  // Command substitution and backticks are always rejected.
+  assert.equal(isReadOnlyShellCommand("ls $(pwd)"), false);
+  assert.equal(isReadOnlyShellCommand("ls `pwd`"), false);
+  // ripgrep is allowed without its execution options.
+  assert.equal(isReadOnlyShellCommand("rg -n 'token' src"), true);
+  assert.equal(isReadOnlyShellCommand("rg --pre cat -n src"), false);
+});
+
+test("verify shell guard accepts verification commands", () => {
+  assert.equal(isShellCommandAllowed("npm run workspaces:typecheck", "verify"), true);
+  assert.equal(isShellCommandAllowed("npm run build:prod", "verify"), true);
+  assert.equal(isShellCommandAllowed("git diff --check", "verify"), true);
+  assert.equal(isShellCommandAllowed("npm run deploy", "verify"), false);
+  assert.equal(isShellCommandAllowed("npm install left-pad", "verify"), false);
+  assert.equal(isShellCommandAllowed("npm test && npx tsc --noEmit", "verify"), true);
+});
+
 test("agent validation rejects unsafe definitions", () => {
   const base = findAgent(agents(), "general-purpose")!;
   assert.throws(() => validateAgentDefinition({ ...base, name: "bad", readonly: true, shellPolicy: "unrestricted" }), /requires shellPolicy/);
