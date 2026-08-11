@@ -8,7 +8,7 @@ import { applyAgentModelSettings, discoverAgents, findAgent } from "../src/agent
 import { agentAllowsNestedAgents, resolveAgentTools } from "../src/capabilities.ts";
 import { applyConfig, DEFAULT_CONFIG, loadAgentModelSettings } from "../src/config.ts";
 import { buildAgentToolDescription, buildParentPolicy, classifyDispatch, resolveTaskIsolation } from "../src/prompts.ts";
-import { createFreshChildSessionManager, createTaskQuota, finalNewTurnText, isMutatingShellCommand, isReadOnlyShellCommand, isShellCommandAllowed, prepareForkSession, validateAgentDefinition } from "../src/runtime.ts";
+import { createFreshChildSessionManager, createTaskQuota, finalNewTurnText, prepareForkSession, validateAgentDefinition } from "../src/runtime.ts";
 import { formatTaskOutputForModel, type TaskRecord } from "../src/tasks.ts";
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -226,16 +226,56 @@ test("isolation selection honors explicit override and agent default", () => {
   assert.equal(resolveTaskIsolation(undefined, undefined), undefined);
 });
 
-test("capability resolver selects Pi child-session tools", () => {
-  const general = findAgent(agents(), "general-purpose")!;
-  assert.equal(agentAllowsNestedAgents(general), true);
-  const custom = { ...general, name: "custom", tools: ["read", "search_docs", "Agent"], disallowedTools: ["write"] };
+test("bundled roles resolve every available parent builtin tool", () => {
+  const inventory = ["read", "bash", "edit", "write", "grep", "find", "ls"].map(name => ({ name }));
+  for (const name of ["Explore", "Plan", "verification"]) {
+    const agent = findAgent(agents(), name)!;
+    assert.deepEqual(agent.tools, ["*"], `${name} should request the full tool inventory`);
+    assert.equal(agent.readonly, true, `${name} keeps advisory read-only metadata`);
+    assert.equal(agent.shellPolicy, "unrestricted", `${name} should describe unrestricted Bash access`);
+    assert.deepEqual(
+      resolveAgentTools({ agent, inventory, allowNestedAgent: false }).sort(),
+      inventory.map(tool => tool.name).sort(),
+      `${name} should receive all available parent builtin tools`,
+    );
+  }
+});
+
+test("explicit empty parent inventory grants no builtin child tools", () => {
+  const agent = findAgent(agents(), "general-purpose")!;
+  assert.deepEqual(resolveAgentTools({ agent, inventory: [], allowNestedAgent: false }), []);
+  assert.deepEqual(
+    resolveAgentTools({ agent, inventory: undefined, allowNestedAgent: false }).sort(),
+    ["read", "bash", "edit", "write", "grep", "find", "ls"].sort(),
+  );
+});
+
+test("readonly custom agents retain explicitly selected tools", () => {
+  const base = findAgent(agents(), "general-purpose")!;
+  const inventory = ["read", "bash", "edit", "write", "grep", "find", "ls"].map(name => ({ name }));
+  const wildcard = { ...base, name: "readonly-wildcard", readonly: true, tools: ["*"] };
+  assert.deepEqual(
+    resolveAgentTools({ agent: wildcard, inventory, allowNestedAgent: false }).sort(),
+    inventory.map(tool => tool.name).sort(),
+  );
+
+  const explicit = { ...base, name: "readonly-explicit", readonly: true, tools: ["read", "edit", "write"] };
+  assert.deepEqual(
+    resolveAgentTools({ agent: explicit, inventory, allowNestedAgent: false }).sort(),
+    ["edit", "read", "write"],
+  );
+});
+
+test("explicit custom tools and disallowedTools remain effective", () => {
+  const base = findAgent(agents(), "general-purpose")!;
+  assert.equal(agentAllowsNestedAgents(base), true);
+  const custom = { ...base, name: "custom", tools: ["read", "bash", "write", "Agent"], disallowedTools: ["write"] };
   const resolved = resolveAgentTools({
     agent: custom,
-    inventory: [{ name: "read" }, { name: "write" }, { name: "search_docs" }],
+    inventory: [{ name: "read" }, { name: "bash" }, { name: "write" }, { name: "edit" }],
     allowNestedAgent: true,
   });
-  assert.deepEqual(resolved.sort(), ["Agent", "read"].sort());
+  assert.deepEqual(resolved.sort(), ["Agent", "bash", "read"].sort());
 });
 
 test("task quota waits in FIFO order for shared capacity", async () => {
@@ -318,97 +358,15 @@ test("task quota rejects a synchronous dependency when its parent holds the only
   assert.equal(quota.inUse, 0);
 });
 
-test("read-only shell guard blocks mutations", () => {
-  assert.equal(isReadOnlyShellCommand("git status --short"), true);
-  assert.equal(isReadOnlyShellCommand("grep -R token src | head"), true);
-  assert.equal(isReadOnlyShellCommand("find src -type f"), true);
-  assert.equal(isReadOnlyShellCommand("find src -delete"), false);
-  assert.equal(isReadOnlyShellCommand("ls\nrm -rf /tmp/x"), false);
-  assert.equal(isReadOnlyShellCommand("ls & rm -rf /tmp/x"), false);
-  assert.equal(isReadOnlyShellCommand("git status\ngit reset --hard"), false);
-  assert.equal(isReadOnlyShellCommand("find src -fprintf /tmp/x %p"), false);
-  assert.equal(isReadOnlyShellCommand("sort -o out.txt in.txt"), false);
-  assert.equal(isReadOnlyShellCommand("python3 -c 'open(\"x\",\"w\").write(\"y\")'"), false);
-  assert.equal(isShellCommandAllowed("npm test && npx tsc --noEmit", "verify"), true);
-  assert.equal(isShellCommandAllowed("npm pack --dry-run", "verify"), true);
-  assert.equal(isShellCommandAllowed("npm pack", "verify"), false);
-  assert.equal(isShellCommandAllowed("python3 -m pytest", "verify"), true);
-  assert.equal(isShellCommandAllowed("npm install left-pad", "verify"), false);
-  assert.equal(isMutatingShellCommand("git commit -am test"), true);
-  assert.equal(isMutatingShellCommand("echo data > file.txt"), true);
-  assert.equal(isMutatingShellCommand("rm -rf build"), true);
-});
-
-test("read-only shell guard accepts expanded inspection commands", () => {
-  // Previously-blocked read-only git subcommands.
-  assert.equal(isReadOnlyShellCommand("git log --oneline --decorate -12"), true);
-  assert.equal(isReadOnlyShellCommand("git show --stat --oneline 6af6425"), true);
-  assert.equal(isReadOnlyShellCommand("git diff HEAD --stat"), true);
-  assert.equal(isReadOnlyShellCommand("git diff --check"), true);
-  assert.equal(isReadOnlyShellCommand("git diff --cached"), true);
-  assert.equal(isReadOnlyShellCommand("git diff --name-only 6af6425^ 6af6425"), true);
-  assert.equal(isReadOnlyShellCommand("git cat-file -p 8a32502 | head -20"), true);
-  assert.equal(isReadOnlyShellCommand("git diff-tree -r --stat 8a32502"), true);
-  assert.equal(isReadOnlyShellCommand("git ls-tree --name-only HEAD"), true);
-  assert.equal(isReadOnlyShellCommand("git check-ignore -v node_modules/.bin/eslint"), true);
-  assert.equal(isReadOnlyShellCommand("git log -1 --format=%B 8a32502"), true);
-  assert.equal(isReadOnlyShellCommand("git show 8a32502:package.json | head -5"), true);
-  assert.equal(isReadOnlyShellCommand("git tag --list"), true);
-  assert.equal(isReadOnlyShellCommand("git tag"), true);
-  assert.equal(isReadOnlyShellCommand("git branch -a"), true);
-  // git commands that write still stay blocked.
-  assert.equal(isReadOnlyShellCommand("git tag v1.0"), false);
-  assert.equal(isReadOnlyShellCommand("git branch new-branch"), false);
-  assert.equal(isReadOnlyShellCommand("git diff --output=/tmp/x"), false);
-  assert.equal(isReadOnlyShellCommand("git diff --ext-diff"), false);
-  assert.equal(isReadOnlyShellCommand("git reset --hard HEAD"), false);
-  assert.equal(isReadOnlyShellCommand("git checkout main"), false);
-  assert.equal(isReadOnlyShellCommand("git push origin main"), false);
-  // cd/echo with fallback patterns; echo writes are still blocked by redirection.
-  assert.equal(isReadOnlyShellCommand("cd repo && git status && git log --oneline -5"), true);
-  assert.equal(isReadOnlyShellCommand("git diff HEAD --stat 2>/dev/null || echo \"parent-not-found\""), true);
-  assert.equal(isReadOnlyShellCommand("echo hi > file.txt"), false);
-  // Globs, redirections to /dev/null, pipes inside quotes, and range reads.
-  assert.equal(isReadOnlyShellCommand("ls *.tgz"), true);
-  assert.equal(isReadOnlyShellCommand("git log --oneline 2>/dev/null | head -5"), true);
-  assert.equal(isReadOnlyShellCommand("git rev-parse main:tsconfig.json 2>&1"), true);
-  assert.equal(isReadOnlyShellCommand("grep -rn 'NODE_ENV' AGENTS.md 2>/dev/null | head -20"), true);
-  assert.equal(isReadOnlyShellCommand("grep -iE 'tgz|packages' file.txt"), true);
-  assert.equal(isReadOnlyShellCommand("find . -maxdepth 3 -type f \\( -name '*.yml' -o -name '*.yaml' \\) | sort"), true);
-  assert.equal(isReadOnlyShellCommand("sed -n '630,680p' /var/log/build.log"), true);
-  assert.equal(isReadOnlyShellCommand("cat a b > out.txt"), false);
-  assert.equal(isReadOnlyShellCommand("cat a 2>/dev/null"), true);
-  assert.equal(isReadOnlyShellCommand("sed -i 's/a/b/' file"), false);
-  assert.equal(isReadOnlyShellCommand("sed -n '1,5w /tmp/out' file"), false);
-  // Version queries are allowed; code execution stays blocked.
-  assert.equal(isReadOnlyShellCommand("node -v"), true);
-  assert.equal(isReadOnlyShellCommand("node --version"), true);
-  assert.equal(isReadOnlyShellCommand("npm -v"), true);
-  assert.equal(isReadOnlyShellCommand("python3 -V"), true);
-  assert.equal(isReadOnlyShellCommand("ruby -v"), true);
-  assert.equal(isReadOnlyShellCommand("node -e 'console.log(1)'"), false);
-  assert.equal(isReadOnlyShellCommand("python3 -c 'print(1)'"), false);
-  assert.equal(isReadOnlyShellCommand("perl -e 'print $^V'"), false);
-  // Command substitution and backticks are always rejected.
-  assert.equal(isReadOnlyShellCommand("ls $(pwd)"), false);
-  assert.equal(isReadOnlyShellCommand("ls `pwd`"), false);
-  // ripgrep is allowed without its execution options.
-  assert.equal(isReadOnlyShellCommand("rg -n 'token' src"), true);
-  assert.equal(isReadOnlyShellCommand("rg --pre cat -n src"), false);
-});
-
-test("verify shell guard accepts verification commands", () => {
-  assert.equal(isShellCommandAllowed("npm run workspaces:typecheck", "verify"), true);
-  assert.equal(isShellCommandAllowed("npm run build:prod", "verify"), true);
-  assert.equal(isShellCommandAllowed("git diff --check", "verify"), true);
-  assert.equal(isShellCommandAllowed("npm run deploy", "verify"), false);
-  assert.equal(isShellCommandAllowed("npm install left-pad", "verify"), false);
-  assert.equal(isShellCommandAllowed("npm test && npx tsc --noEmit", "verify"), true);
-});
-
-test("agent validation rejects unsafe definitions", () => {
+test("agent validation accepts advisory readonly metadata with unrestricted Bash", () => {
   const base = findAgent(agents(), "general-purpose")!;
-  assert.throws(() => validateAgentDefinition({ ...base, name: "bad", readonly: true, shellPolicy: "unrestricted" }), /requires shellPolicy/);
+  assert.doesNotThrow(() => validateAgentDefinition({
+    ...base,
+    name: "readonly-unrestricted",
+    readonly: true,
+    shellPolicy: "unrestricted",
+    tools: ["*"],
+  }));
 });
 
 test("fresh child sessions live in the parent catalogue with parentSession", async () => {

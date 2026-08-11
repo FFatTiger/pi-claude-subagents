@@ -248,7 +248,7 @@ Working directory: ${options.cwd}${worktreeNotice}`;
   }
 
   const access = options.agent.readonly
-    ? "This is a read-only role. Do not create, edit, delete, move, or copy files. Use only inspection and validation operations allowed by the runtime."
+    ? "This is a read-only role by instruction, not a runtime sandbox. All tools, including file-modifying tools and unrestricted Bash, may be available. Do not create, edit, delete, move, or copy files, and do not use Bash to modify project or system state."
     : "You may modify files only within the assigned scope. Preserve unrelated user changes and validate the delivered behavior.";
   const delegation = (options.depth ?? 1) < (options.maxDepth ?? 5)
     ? "If Agent is available, use it only for a genuinely independent subtask or a better-matched specialist. Do not delegate your understanding of the assignment; integrate the result yourself."

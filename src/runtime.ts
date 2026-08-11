@@ -17,7 +17,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import type { AgentDefinition, AgentShellPolicy } from "./agents.ts";
+import type { AgentDefinition } from "./agents.ts";
 import { agentAllowsNestedAgents, resolveAgentTools, type ToolDescriptor } from "./capabilities.ts";
 import type { PiSubagentsConfig } from "./config.ts";
 import {
@@ -43,243 +43,6 @@ import {
 
 function escapeXml(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
-}
-
-function stripQuotedSpans(command: string): string {
-  let out = "";
-  let quote: "'" | '"' | undefined;
-  for (const char of command) {
-    if (quote) {
-      if (char === quote) quote = undefined;
-      continue;
-    }
-    if (char === "'" || char === '"') {
-      quote = char;
-      continue;
-    }
-    out += char;
-  }
-  return out;
-}
-
-/** Allow `>/dev/null`, `2>/dev/null`, `2>&1`, `</dev/null`, `<&-` redirections only. */
-function hasOnlyNullRedirections(command: string): boolean {
-  const unquoted = stripQuotedSpans(command);
-  const stripped = unquoted
-    .replace(/[012]?>>?\s*\/dev\/null/g, "")
-    .replace(/[012]?>\s*&[12]/g, "")
-    .replace(/[012]?<\s*\/dev\/null/g, "")
-    .replace(/[012]?<\s*&-/g, "");
-  return !/[<>]/.test(stripped);
-}
-
-function shellSegments(command: string): string[] | null {
-  if (!command.trim()) return null;
-  // Command substitution is the only metacharacter form that can run arbitrary code
-  // inside an otherwise allowlisted command; globs and braces are safe because the
-  // per-segment program allowlist is the real gate.
-  if (/[`]/.test(command) || /\$\(/.test(command)) return null;
-  if (!hasOnlyNullRedirections(command)) return null;
-  const segments: string[] = [];
-  let current = "";
-  let quote: "'" | '"' | undefined;
-  for (let i = 0; i < command.length; i++) {
-    const char = command[i];
-    if (quote) {
-      current += char;
-      if (char === quote) quote = undefined;
-      continue;
-    }
-    if (char === "'" || char === '"') {
-      quote = char;
-      current += char;
-      continue;
-    }
-    if (char === "\n" || char === ";" || char === "|") {
-      if (current.trim()) segments.push(current.trim());
-      current = "";
-      continue;
-    }
-    if (char === "&") {
-      // `&&` joins commands; a bare `&` backgrounds; `2>&1`/`&1` are redirections.
-      if (command[i + 1] === "&") {
-        if (current.trim()) segments.push(current.trim());
-        current = "";
-        i++;
-        continue;
-      }
-      if (/[0-9]/.test(command[i + 1] ?? "")) {
-        current += char;
-        continue;
-      }
-      if (current.trim()) segments.push(current.trim());
-      current = "";
-      continue;
-    }
-    current += char;
-  }
-  if (current.trim()) segments.push(current.trim());
-  return segments.length > 0 ? segments : null;
-}
-
-function commandWords(segment: string): string[] | null {
-  const words: string[] = [];
-  let word = "";
-  let quote: "'" | '"' | undefined;
-  let escaping = false;
-  for (const char of segment.trim()) {
-    if (escaping) {
-      word += char;
-      escaping = false;
-      continue;
-    }
-    if (char === "\\" && quote !== "'") {
-      escaping = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = undefined;
-      else word += char;
-      continue;
-    }
-    if (char === "'" || char === '"') {
-      quote = char;
-      continue;
-    }
-    if (/\s/.test(char)) {
-      if (word) {
-        words.push(word);
-        word = "";
-      }
-      continue;
-    }
-    word += char;
-  }
-  if (escaping || quote) return null;
-  if (word) words.push(word);
-  // An environment-assignment prefix (`FOO=bar cmd`) is the only mutating form;
-  // `echo "x=$y"`-style `name=value` arguments are harmless output.
-  if (words.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0]!)) return null;
-  return words;
-}
-
-function hasDangerousGitOption(words: string[], segment: string): boolean {
-  if (/(?:^|\s)(?:GIT_EXTERNAL_DIFF|GIT_PAGER|PAGER|GIT_CONFIG(?:_GLOBAL|_SYSTEM|_COUNT|_PARAMETERS)?|GIT_CONFIG_KEY_\d+|GIT_CONFIG_VALUE_\d+)\s*=/.test(segment)) return true;
-  return words.slice(2).some(word =>
-    word === "--ext-diff"
-    || word === "--textconv"
-    || word === "--paginate"
-    || word === "--config-env"
-    || word === "--exec-path"
-    || word === "--open-files-in-pager"
-    || word.startsWith("--open-files-in-pager=")
-    || word === "--output"
-    || word.startsWith("--output=")
-  );
-}
-
-function hasDangerousInspectionOption(program: string, words: string[]): boolean {
-  const args = words.slice(1);
-  if (program === "rg") {
-    return args.some(word => word === "--pre" || word.startsWith("--pre=") || word === "--pre-glob" || word.startsWith("--pre-glob=") || word === "--path-separator");
-  }
-  return false;
-}
-
-const GIT_READ_SUBCOMMANDS = new Set([
-  "diff", "show", "log", "cat-file", "ls-tree", "diff-tree", "grep", "describe", "blame",
-  "show-ref", "fsck", "merge-base", "rev-list", "name-rev", "count-objects",
-]);
-const GIT_SAFE_BRANCH_FLAGS = new Set([
-  "-a", "--all", "-r", "--remotes", "-v", "-vv", "--show-current", "--list", "--merged", "--no-merged", "--contains",
-]);
-const GIT_SAFE_TAG_FLAGS = new Set([
-  "-l", "--list", "--merged", "--no-merged", "--contains", "--points-at", "--sort", "--format",
-]);
-const VERSION_QUERY_PROGRAMS = new Set([
-  "node", "npm", "pnpm", "yarn", "bun", "npx", "python3", "python", "ruby", "perl", "go",
-  "cargo", "rustc", "git", "docker", "docker-compose", "tsc", "gcc", "clang", "java", "make",
-]);
-const VERSION_FLAGS = new Set(["-v", "-V", "--version", "version"]);
-
-function isSafeGit(words: string[], segment: string): boolean {
-  const subcommand = words[1];
-  if (subcommand === "status" || subcommand === "rev-parse" || subcommand === "ls-files" || subcommand === "check-ignore") return true;
-  if (subcommand === "branch") return words.slice(2).every(arg => GIT_SAFE_BRANCH_FLAGS.has(arg));
-  if (subcommand === "tag") return words.slice(2).every(arg => GIT_SAFE_TAG_FLAGS.has(arg));
-  if (GIT_READ_SUBCOMMANDS.has(subcommand)) return !hasDangerousGitOption(words, segment);
-  return false;
-}
-
-function isSafeSed(words: string[]): boolean {
-  const args = words.slice(1);
-  // Only `sed -n` printing/range reads are safe: `-i` edits in place, `-e`/`-f`
-  // add script inputs, and `w`/`s///w` commands write files.
-  if (!args.includes("-n") && !args.includes("--quiet") && !args.includes("--silent")) return false;
-  if (args.some(arg => arg === "-i" || arg === "-e" || arg === "-f" || arg === "--in-place" || arg === "--expression" || arg === "--file" || arg.startsWith("-i"))) return false;
-  const expression = args.find(arg => !arg.startsWith("-"));
-  if (!expression) return false;
-  if (!/^[0-9,\s;pd!=~$]*$/.test(expression)) return false;
-  return true;
-}
-
-function isInspectionSegment(segment: string): boolean {
-  const words = commandWords(segment);
-  if (!words) return false;
-  const program = words[0];
-  if (!program) return false;
-  if (program === "pwd") return words.length === 1;
-  if (program === "cd" || program === "echo") return true;
-  if (program === "ls") return !words.slice(1).some(word => word.startsWith("--quoting-style") || word === "--hyperlink" || word.startsWith("--hyperlink="));
-  if (["cat", "head", "tail", "wc", "cut", "stat", "du", "grep"].includes(program)) return true;
-  if (program === "rg") return !hasDangerousInspectionOption(program, words);
-  if (program === "uniq") return words.length <= 2;
-  if (program === "sed") return isSafeSed(words);
-  if (program === "git") return isSafeGit(words, segment);
-  if (program === "sort") return words.length === 1;
-  if (program === "find") return !words.some(word => /^-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/.test(word));
-  if (VERSION_QUERY_PROGRAMS.has(program)) return words.length === 2 && VERSION_FLAGS.has(words[1]);
-  return false;
-}
-
-function isVerificationSegment(segment: string): boolean {
-  if (isInspectionSegment(segment)) return true;
-  const words = commandWords(segment);
-  if (!words) return false;
-  const program = words[0];
-  const args = words.slice(1);
-  if (!program) return false;
-  if (["npm", "pnpm", "yarn", "bun"].includes(program)) {
-    if (program === "npm" && args[0] === "pack") {
-      return args.length === 2 && args[1] === "--dry-run";
-    }
-    const script = program === "yarn" ? args[0] : args[0] === "run" ? args[1] : args[0];
-    return Boolean(script && /^(?:[\w.-]+:)?(?:test|check|typecheck|lint|build)(?::[\w.-]+)?$/.test(script));
-  }
-  if (program === "npx") return args[0] === "tsc" && args.includes("--noEmit");
-  if (program === "tsc") return args.includes("--noEmit");
-  if (program === "node") return args[0] === "--test" && !args.slice(1).some(arg => arg === "--test");
-  if (program === "python" || program === "python3") return args[0] === "-m" && args[1] === "pytest";
-  if (program === "pytest") return true;
-  if (program === "cargo") return args[0] === "test" || args[0] === "check";
-  if (program === "go") return args[0] === "test";
-  if (program === "make") return args.length === 0 || args.every(arg => /^(?:test|check|lint|build)$/.test(arg));
-  return false;
-}
-
-export function isShellCommandAllowed(command: string, policy: AgentShellPolicy): boolean {
-  if (policy === "unrestricted") return true;
-  const segments = shellSegments(command);
-  if (!segments) return false;
-  return segments.every(segment => policy === "verify" ? isVerificationSegment(segment) : isInspectionSegment(segment));
-}
-
-export function isReadOnlyShellCommand(command: string): boolean {
-  return isShellCommandAllowed(command, "inspect");
-}
-
-export function isMutatingShellCommand(command: string): boolean {
-  return !isReadOnlyShellCommand(command);
 }
 
 /** Create a Fresh child session in Pi's standard catalogue, linked to the parent when available. */
@@ -551,9 +314,6 @@ function runGit(cwd: string, args: string[]): Promise<{ stdout: string; stderr: 
 }
 
 export function validateAgentDefinition(agent: AgentDefinition): void {
-  if (agent.readonly && agent.shellPolicy === "unrestricted") {
-    throw new Error(`Agent '${agent.name}' requires shellPolicy: inspect or verify when readonly is true.`);
-  }
   resolveTools(agent);
 }
 
@@ -689,21 +449,8 @@ function assistantToolCalls(message: AgentMessage): Array<Extract<Extract<AgentM
   return message.content.filter((part): part is Extract<(typeof message.content)[number], { type: "toolCall" }> => part.type === "toolCall");
 }
 
-function toolPolicyBlock(agent: AgentDefinition, toolName: string, input: Record<string, unknown>): { kind: "readonly" | "shell_policy"; reason: string } | undefined {
-  if (agent.readonly && (toolName === "edit" || toolName === "write")) {
-    return { kind: "readonly", reason: `${agent.name} is read-only.` };
-  }
-  if (toolName === "bash" && agent.shellPolicy !== "unrestricted") {
-    const command = typeof input.command === "string" ? input.command : "";
-    if (!isShellCommandAllowed(command, agent.shellPolicy)) {
-      return { kind: "shell_policy", reason: `${agent.name} only permits its configured ${agent.shellPolicy} shell-command allowlist.` };
-    }
-  }
-  return undefined;
-}
-
 export function createChildLifecycleExtension(
-  agent: AgentDefinition,
+  _agent: AgentDefinition,
   lifecycle: ChildLifecycleController,
   options: {
     maxTurns?: number;
@@ -725,8 +472,7 @@ export function createChildLifecycleExtension(
       lifecycle.onTurnStart();
     });
     pi.on("tool_call", event => {
-      const policy = toolPolicyBlock(agent, event.toolName, event.input);
-      const admission = lifecycle.admitTool(event.toolName, policy);
+      const admission = lifecycle.admitTool(event.toolName);
       if (admission.queueWrapUp) enterToolWrapUp();
       if (!admission.allowed) return { block: true, reason: admission.reason };
     });
@@ -1296,6 +1042,53 @@ export async function launchTask(options: {
   };
 }
 
+export interface ResolvedResumeCapabilities {
+  tools: string[];
+  readonly: boolean;
+  shellPolicy: AgentDefinition["shellPolicy"];
+  allowNestedAgent: boolean;
+}
+
+export interface ResolveResumeCapabilitiesOptions {
+  agent: AgentDefinition;
+  config: PiSubagentsConfig;
+  recordDepth?: number;
+  forked?: boolean;
+  inventory?: ToolDescriptor[];
+  hasAgentRegistry: boolean;
+  hasTaskQuota: boolean;
+}
+
+export function resolveResumeCapabilities(options: ResolveResumeCapabilitiesOptions): ResolvedResumeCapabilities {
+  const depth = options.recordDepth ?? 1;
+  const allowNestedAgent = !options.forked
+    && options.config.enableNestedAgents
+    && agentAllowsNestedAgents(options.agent)
+    && depth < options.config.maxAgentDepth
+    && options.hasAgentRegistry
+    && options.hasTaskQuota;
+  return {
+    tools: resolveTools(options.agent, {
+      inventory: options.inventory,
+      allowNestedAgent,
+    }),
+    readonly: options.agent.readonly,
+    shellPolicy: options.agent.shellPolicy,
+    allowNestedAgent,
+  };
+}
+
+export function applyResumeCapabilities(
+  record: Pick<TaskRecord, "effectiveTools" | "effectiveReadonly" | "effectiveShellPolicy">,
+  options: ResolveResumeCapabilitiesOptions,
+): ResolvedResumeCapabilities {
+  const resolved = resolveResumeCapabilities(options);
+  record.effectiveTools = [...resolved.tools];
+  record.effectiveReadonly = resolved.readonly;
+  record.effectiveShellPolicy = resolved.shellPolicy;
+  return resolved;
+}
+
 export async function resumeCompletedTask(options: {
   record: TaskRecord;
   message: string;
@@ -1321,18 +1114,17 @@ export async function resumeCompletedTask(options: {
   if (options.record.worktreeCleaned) {
     throw new Error(`Task ${options.record.id} used a cleaned isolated worktree; start a new isolated task instead of resuming it.`);
   }
-  if (options.record.effectiveTools === undefined || options.record.effectiveReadonly === undefined || !options.record.effectiveShellPolicy) {
-    throw new Error(`Task ${options.record.id} lacks its original effective capability snapshot and cannot be resumed safely.`);
-  }
-  if (options.record.effectiveTools.includes("Agent") && (!options.agents || !options.parent?.taskQuota)) {
-    throw new Error(`Task ${options.record.id} originally had nested Agent capability, but Resume lacks the original registry or shared quota. Start a new task instead.`);
-  }
-  const resumeTools = [...options.record.effectiveTools];
-  const resumeAgent: AgentDefinition = {
-    ...options.agent,
-    readonly: options.record.effectiveReadonly,
-    shellPolicy: options.record.effectiveShellPolicy,
-  };
+  const resumeCapabilities = applyResumeCapabilities(options.record, {
+    agent: options.agent,
+    config: options.config,
+    recordDepth: options.record.depth,
+    forked: options.record.forked,
+    inventory: options.parent?.toolInventory,
+    hasAgentRegistry: Boolean(options.agents),
+    hasTaskQuota: Boolean(options.parent?.taskQuota),
+  });
+  const resumeTools = resumeCapabilities.tools;
+  const resumeAgent = options.agent;
   const persistedMaxToolCalls = options.record.maxToolCalls ?? options.config.defaultMaxToolCalls;
   const persistedSoftToolCalls = options.record.softToolCalls ?? options.config.defaultSoftToolCalls;
   const persistedToolBudgetBlock = options.record.toolBudgetBlock ?? options.config.defaultToolBudgetBlock;
@@ -1459,7 +1251,7 @@ export async function resumeCompletedTask(options: {
       const sessionManager = SessionManager.open(sessionFile, path.dirname(sessionFile), cwd);
       const resolved = options.record.model ? resolveCliModel({ cliModel: options.record.model, modelRuntime }) : undefined;
       const restoredTools = [...resumeTools];
-      const resumeNestedTool = resumeTools.includes("Agent") && options.agents && options.parent?.taskQuota
+      const resumeNestedTool = resumeCapabilities.allowNestedAgent && options.agents && options.parent?.taskQuota
         ? createNestedAgentAdapter({
           agent: resumeAgent,
           agents: options.agents,

@@ -6,15 +6,18 @@ import * as path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { discoverAgents, findAgent } from "../src/agents.ts";
+import { DEFAULT_CONFIG } from "../src/config.ts";
 import { createChildLifecycleController } from "../src/lifecycle.ts";
 import {
   FINAL_HANDOFF_DIRECTIVE,
+  applyResumeCapabilities,
   applyAssistantTokenUsage,
   applyLifecycleUsage,
   clearQueuedMessagesAfterFinalHandoff,
   createChildLifecycleExtension,
   deriveThinkingClampReason,
   finalizeInvocationRecord,
+  resolveResumeCapabilities,
   type LifecycleUsageBaseline,
 } from "../src/runtime.ts";
 import type { TaskRecord } from "../src/tasks.ts";
@@ -286,6 +289,81 @@ test("lifecycle extension blocks selected tools and queues a constructive wrap-u
     toolCallsExecuted: 3,
     toolCallsBlocked: 1,
   });
+});
+
+test("lifecycle extension does not enforce readonly or shell metadata", async () => {
+  const plan = findAgent(discoverAgents({ cwd: packageRoot, packageRoot, includeProject: false }).agents, "Plan")!;
+  const lifecycle = createChildLifecycleController({});
+  const handlers = new Map<string, Function>();
+  const fakePi = {
+    on(event: string, handler: Function) { handlers.set(event, handler); },
+    sendUserMessage() {},
+    getActiveTools() { return ["bash", "edit", "write"]; },
+    setActiveTools() {},
+  };
+
+  (createChildLifecycleExtension(plan, lifecycle) as ExtensionFactory)(fakePi as never);
+  const ctx = { abort() {}, hasPendingMessages() { return false; } };
+  await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 0 }, ctx);
+  assert.deepEqual(await handlers.get("tool_call")!({ toolName: "edit", input: { path: "x.ts" } }, ctx), undefined);
+  assert.deepEqual(await handlers.get("tool_call")!({ toolName: "write", input: { path: "x.ts" } }, ctx), undefined);
+  assert.deepEqual(await handlers.get("tool_call")!({ toolName: "bash", input: { command: "rm -rf build" } }, ctx), undefined);
+  assert.deepEqual(lifecycle.snapshot.usage, {
+    turns: 1,
+    toolCallsRequested: 3,
+    toolCallsExecuted: 3,
+    toolCallsBlocked: 0,
+  });
+});
+
+test("resume capabilities replace legacy restricted snapshots with current role tools", () => {
+  const verification = findAgent(discoverAgents({ cwd: packageRoot, packageRoot, includeProject: false }).agents, "verification")!;
+  const inventory = ["read", "bash", "edit", "write", "grep", "find", "ls", "Agent"].map(name => ({ name }));
+  const legacyRecord: Pick<TaskRecord, "effectiveTools" | "effectiveReadonly" | "effectiveShellPolicy"> = {
+    effectiveTools: ["read", "grep", "find", "ls"],
+    effectiveReadonly: true,
+    effectiveShellPolicy: "verify",
+  };
+  const capabilities = applyResumeCapabilities(legacyRecord, {
+    agent: verification,
+    config: { ...DEFAULT_CONFIG, enableNestedAgents: true, maxAgentDepth: 5 },
+    recordDepth: 1,
+    inventory,
+    hasAgentRegistry: true,
+    hasTaskQuota: true,
+  });
+
+  assert.deepEqual(capabilities.tools.sort(), ["Agent", "bash", "edit", "find", "grep", "ls", "read", "write"].sort());
+  assert.deepEqual(legacyRecord.effectiveTools!.sort(), capabilities.tools.sort());
+  assert.equal(legacyRecord.effectiveReadonly, true);
+  assert.equal(legacyRecord.effectiveShellPolicy, "unrestricted");
+  assert.equal(capabilities.allowNestedAgent, true);
+
+  const missingSnapshot: Pick<TaskRecord, "effectiveTools" | "effectiveReadonly" | "effectiveShellPolicy"> = {};
+  applyResumeCapabilities(missingSnapshot, {
+    agent: verification,
+    config: { ...DEFAULT_CONFIG, enableNestedAgents: false },
+    recordDepth: 1,
+    inventory,
+    hasAgentRegistry: false,
+    hasTaskQuota: false,
+  });
+  assert.deepEqual(missingSnapshot.effectiveTools!.sort(), ["bash", "edit", "find", "grep", "ls", "read", "write"].sort());
+  assert.equal(missingSnapshot.effectiveReadonly, true);
+  assert.equal(missingSnapshot.effectiveShellPolicy, "unrestricted");
+
+  const withoutNestedInfrastructure = resolveResumeCapabilities({
+    agent: verification,
+    config: { ...DEFAULT_CONFIG, enableNestedAgents: true, maxAgentDepth: 5 },
+    recordDepth: 1,
+    inventory,
+    hasAgentRegistry: false,
+    hasTaskQuota: false,
+  });
+  assert.equal(withoutNestedInfrastructure.tools.includes("Agent"), false);
+  assert.equal(withoutNestedInfrastructure.tools.includes("bash"), true);
+  assert.equal(withoutNestedInfrastructure.tools.includes("edit"), true);
+  assert.equal(withoutNestedInfrastructure.tools.includes("write"), true);
 });
 
 test("soft grace does not clear the Pi message queue", () => {

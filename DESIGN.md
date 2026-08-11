@@ -66,7 +66,7 @@ The synthetic `fork` type uses Pi `SessionManager` to create a branch from the c
 
 ### Resume
 
-A resumable role reopens its persisted `session.jsonl`, reuses recorded budgets and trust, appends a new instruction, and appends new output to the task artifact.
+A resumable role reopens its persisted `session.jsonl`, reuses recorded budgets and trust, resolves capabilities from the current role definition and current parent inventory, appends a new instruction, and appends new output to the task artifact. Historical effective-tool snapshots are refreshed rather than treated as permanent authority.
 
 ### Background
 
@@ -74,7 +74,7 @@ Interactive and RPC launches default to background. Print and JSON launches comp
 
 ## Prompt architecture
 
-The parent and child contracts are source-backed behavioral reconstructions adapted to Pi. They preserve architecture-relevant native constraints, including non-duplication, `Never delegate understanding`, no polling or fabricated background results, hard read-only role boundaries, adversarial verification, and direct Fork execution. Claude-specific identity, paths, configuration, memory, hooks, permissions, and MCP syntax are excluded.
+The parent and child contracts are source-backed behavioral reconstructions adapted to Pi. They preserve architecture-relevant native constraints, including non-duplication, `Never delegate understanding`, no polling or fabricated background results, strict prompt-level read-only role instructions, adversarial verification, and direct Fork execution. Claude-specific identity, paths, configuration, memory, hooks, permissions, and MCP syntax are excluded.
 
 The parent contract covers:
 
@@ -94,7 +94,7 @@ The parent contract covers:
 - independent adversarial verification without waiting for the user and parent spot-checking
 - bounded, restrained nested delegation
 
-Child contracts define role, scope, evidence, allowed access, delegation depth, and handoff shape. Runtime restrictions remain authoritative where a prompt also states the boundary.
+Child contracts define role, scope, evidence, instructed access, delegation depth, and handoff shape. Read-only role constraints are prompt-only: all bundled roles may receive full tools and unrestricted Bash, so runtime capability availability does not replace the role instruction.
 
 ## Lifecycle semantics
 
@@ -138,9 +138,10 @@ Selection pipeline:
 
 1. intersect with the active parent inventory;
 2. apply role `disallowedTools`;
-3. remove edit/write for read-only roles;
-4. apply the role `tools` selection;
-5. add the child `Agent` adapter when nesting is enabled for the role and depth.
+3. apply the role `tools` selection;
+4. add the child `Agent` adapter when nesting is enabled for the role and depth.
+
+Bundled roles use `tools: "*"`, so Explore, Plan, verification, general-purpose, Fresh, and Fork workers receive all available parent builtin tools, including `bash`, `edit`, and `write`. Bash is unrestricted. `readonly` and `shellPolicy` remain accepted and persisted as compatibility/descriptive metadata, but they do not automatically remove tools or inspect commands. Explicit custom `tools`/`disallowedTools` inventories remain effective.
 
 The selected names are passed to `createAgentSession({ tools })`. The nested `Agent` adapter is supplied through `customTools`.
 
@@ -158,11 +159,13 @@ Nested agents execute synchronously inside their direct parent AgentSession and 
 - named child roles
 - root-level inherited-context branching
 
-## Safety
+## Trust and safety
 
-- exact role tool selection
-- read-only tool removal
-- inspect/verify shell allowlists
+The runtime deliberately trusts child roles with the capabilities selected by their role inventory. Bundled roles request full available tools and unrestricted Bash; Explore, Plan, and verification remain non-modifying only by strict prompt instruction. This is not a security sandbox. Use OS permissions, containers, VMs, or equivalent process isolation for untrusted models or tasks.
+
+Runtime-enforced controls are:
+
+- explicit custom role tool selection and parent-inventory intersection
 - mandatory recurring root-parent progress supervision with persisted checkpoints (default/general recommendation 40/25)
 - concise child stage notes after meaningful phases and at least every 8–12 tool-using turns
 - foreground-to-supervised-background promotion at the first warning

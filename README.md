@@ -149,12 +149,12 @@ Discovery order (closest wins):
 ---
 name: code-reviewer
 description: Expert reviewer for correctness, security, maintainability, and tests.
-tools: read, grep, find, bash
+tools: "*"
 model: inherit
 thinking: high
 skills: code-review
 readonly: true
-shellPolicy: verify
+shellPolicy: unrestricted
 background: true
 isolation: worktree
 warningTurns: 40
@@ -171,6 +171,8 @@ Review the assigned change and return an evidence-based report.
 ```
 
 Supported frontmatter: `name`, `description`, `tools`, `disallowedTools`, `model`, `thinking`, `skills`, `readonly`, `shellPolicy`, `background`, `context`, `isolation`, `warningTurns`, `warningIntervalTurns`, `maxTurns`, `graceTurns`, `maxToolCalls`, `softToolCalls`, `toolBudgetBlock`, `timeoutMs`, `oneShot`. Warning settings control mandatory parent supervision. Hard budgets and timeouts are advanced unattended policies and are not exposed as ordinary `Agent` invocation arguments.
+
+`tools` and `disallowedTools` are explicit, user-authored capability selection and remain enforced after intersection with the parent inventory. `readonly` and `shellPolicy` are accepted as compatibility/descriptive role metadata only; they do not automatically remove tools, inspect Bash commands, or enforce a permission boundary.
 
 Child coding tools are Pi-native: `read`, `bash`, `edit`, `write`, `grep`, `find`, `ls`, filtered by parent inventory and role definition. Nested roles may also receive the child `Agent` adapter.
 
@@ -197,12 +199,18 @@ A role with `Agent` access may launch a named child. Nested work returns to the 
 - Persisted `rootParentSessionId`, `parentTaskId`, `depth`
 - Named child roles; root-session Fork only at the root
 
-## Safety and lifecycle
+## Trust, capability selection, and lifecycle
 
-Runtime enforcement includes:
+The child runtime deliberately uses a trust-based capability model:
 
-- Exact role tool selection; read-only roles lose edit/write
-- Shell policies: `inspect`, `verify`, `unrestricted`
+- Bundled `Explore`, `Plan`, `verification`, and `general-purpose` roles request the full available parent tool inventory with unrestricted Bash. Fresh and Fork workers therefore have full tools unless an explicit custom role inventory narrows them.
+- Read-only behavior for bundled exploration, planning, and verification roles is prompt-only and advisory. Their prompts strictly instruct them not to modify files or state, but the runtime does not remove `edit`/`write` or parse and allowlist Bash commands.
+- `readonly` and `shellPolicy` remain accepted and persisted as descriptive/compatibility metadata, not automatic runtime permissions.
+- Explicit custom-agent `tools` and `disallowedTools` selection remains effective after intersection with the active parent inventory.
+- Do not rely on role prompts as a security sandbox. Use OS permissions, containers, VMs, or equivalent process isolation for untrusted models or tasks.
+
+Lifecycle enforcement includes:
+
 - Lifecycle phases: `starting → working → final_handoff → terminal`
 - Each root `Agent` invocation explicitly chooses positive `warning_turns` and `warning_interval_turns` for that task instead of copying a universal pair
 - Default and general recommendation: `40 / 25` (first checkpoint / recurring interval)

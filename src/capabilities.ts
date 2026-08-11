@@ -20,18 +20,14 @@ export function resolveAgentTools(options: {
   inventory?: ToolDescriptor[];
   allowNestedAgent: boolean;
 }): string[] {
-  const parentTools = options.inventory?.length
-    ? options.inventory.map(tool => tool.name)
-    : BUILTIN_CHILD_TOOLS;
+  const parentTools = options.inventory === undefined
+    ? BUILTIN_CHILD_TOOLS
+    : options.inventory.map(tool => tool.name);
   const childRuntimeTools = new Set(BUILTIN_CHILD_TOOLS.filter(name => parentTools.includes(name)));
   const requested = options.agent.tools;
   const nestedSelected = options.allowNestedAgent && agentAllowsNestedAgents(options.agent);
 
   for (const denied of options.agent.disallowedTools ?? []) childRuntimeTools.delete(denied);
-  if (options.agent.readonly) {
-    childRuntimeTools.delete("edit");
-    childRuntimeTools.delete("write");
-  }
 
   if (!requested?.length || requested.includes("*")) {
     return [...childRuntimeTools, ...(nestedSelected ? ["Agent"] : [])];
