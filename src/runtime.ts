@@ -45,6 +45,28 @@ function escapeXml(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 }
 
+/**
+ * Build the ordered model-attempt chain for a task launch.
+ *
+ * Index 0 is always `undefined`, meaning "resolve the configured primary model
+ * (and its parse-time fallback) inside makeChildSession". When the agent declares
+ * a `fallbackModel` distinct from the actual primary reference, a second entry
+ * forces a runtime retry with that exact model after an early (pre-work)
+ * provider/startup failure, such as a 503 auth error on the first model call.
+ */
+export function buildModelChain(spec: LaunchSpec, parentModel?: string): Array<string | undefined> {
+  const fallbackRef = spec.agent.fallbackModel?.trim();
+  if (!fallbackRef) return [undefined];
+  const frontmatterModel = spec.agent.model === "inherit" ? undefined : spec.agent.model;
+  // Mirrors makeChildSession's primary resolution: forked inherits the parent
+  // model; otherwise explicit call model > agent model > parent model.
+  const primaryRef = spec.forked
+    ? parentModel
+    : spec.model ?? frontmatterModel ?? parentModel;
+  if (fallbackRef === primaryRef) return [undefined];
+  return [undefined, fallbackRef];
+}
+
 /** Create a Fresh child session in Pi's standard catalogue, linked to the parent when available. */
 export function createFreshChildSessionManager(options: {
   cwd: string;
@@ -444,6 +466,34 @@ function assistantText(message: AgentMessage): string {
     .trim();
 }
 
+/**
+ * True when the child terminated on its very first model call with a provider
+ * error (for example a 503 auth failure) before performing any real work.
+ * Pi surfaces provider failures as an assistant error message with
+ * `stopReason: "error"` and an `errorMessage`; the prompt promise itself
+ * resolves normally, so retry detection must inspect the produced messages.
+ */
+export function isEarlyProviderError(
+  messages: AgentMessage[],
+  lifecycle: ChildLifecycleController,
+): boolean {
+  if (lifecycle.snapshot.usage.toolCallsExecuted !== 0) return false;
+  if (extractFinalText(messages)) return false;
+  const lastAssistant = [...messages].reverse().find(
+    (message): message is Extract<AgentMessage, { role: "assistant" }> => message.role === "assistant",
+  );
+  if (!lastAssistant) return false;
+  return lastAssistant.stopReason === "error" && Boolean(lastAssistant.errorMessage?.trim());
+}
+
+/** Internal control signal: the child failed on its first model call before doing work, so the launch may retry with the fallback model. */
+class FallbackRetrySignal extends Error {
+  constructor() {
+    super("early provider failure; retrying with fallback model");
+    this.name = "FallbackRetrySignal";
+  }
+}
+
 function assistantToolCalls(message: AgentMessage): Array<Extract<Extract<AgentMessage, { role: "assistant" }>["content"][number], { type: "toolCall" }>> {
   if (message.role !== "assistant") return [];
   return message.content.filter((part): part is Extract<(typeof message.content)[number], { type: "toolCall" }> => part.type === "toolCall");
@@ -654,6 +704,8 @@ async function makeChildSession(options: {
   worktree?: WorktreeInfo;
   lifecycle: ChildLifecycleController;
   onLifecycleProgressWarning?: (warning: ProgressWarning) => void;
+  /** Force a specific model reference instead of the configured resolution chain (used for fallback retries). */
+  modelOverride?: string;
 }) {
   const cwd = options.worktree?.cwd ?? options.spec.cwd;
   const containmentRoot = options.worktree?.path ?? options.spec.containmentRoot;
@@ -730,11 +782,25 @@ async function makeChildSession(options: {
   }
 
   const frontmatterModel = options.spec.agent.model === "inherit" ? undefined : options.spec.agent.model;
-  const modelRef = options.spec.forked
-    ? options.parent.parentModel
-    : options.spec.model ?? frontmatterModel ?? options.parent.parentModel;
+  const modelRef = options.modelOverride
+    ?? (options.spec.forked
+      ? options.parent.parentModel
+      : options.spec.model ?? frontmatterModel ?? options.parent.parentModel);
   if (!modelRef) throw new Error(`Unable to resolve a model for agent '${options.spec.agent.name}'.`);
-  const resolved = resolveCliModel({ cliModel: modelRef, modelRuntime });
+  let resolved = resolveCliModel({ cliModel: modelRef, modelRuntime });
+  let effectiveModelRef = modelRef;
+  if (resolved.error || !resolved.model) {
+    const primaryError = resolved.error ?? "unresolved";
+    const fallbackRef = options.spec.agent.fallbackModel?.trim();
+    if (fallbackRef && fallbackRef !== modelRef) {
+      const fallbackResolved = resolveCliModel({ cliModel: fallbackRef, modelRuntime });
+      if (!fallbackResolved.error && fallbackResolved.model) {
+        resolved = fallbackResolved;
+        effectiveModelRef = fallbackRef;
+        options.record.modelFallbackNote = `Primary model '${modelRef}' unavailable (${primaryError}); using fallback '${fallbackRef}'.`;
+      }
+    }
+  }
   if (resolved.error || !resolved.model) throw new Error(resolved.error ?? `Unable to resolve model '${modelRef}'.`);
   const requestedThinking = asThinkingLevel(options.spec.forked
     ? options.parent.parentThinking ?? resolved.thinkingLevel
@@ -766,7 +832,7 @@ async function makeChildSession(options: {
     customTools: nestedTool ? [nestedTool] : undefined,
   });
   options.record.sessionFile = result.session.sessionFile;
-  options.record.model = result.session.model ? `${result.session.model.provider}/${result.session.model.id}` : modelRef;
+  options.record.model = result.session.model ? `${result.session.model.provider}/${result.session.model.id}` : effectiveModelRef;
   options.record.requestedThinking = requestedThinking;
   options.record.effectiveThinking = result.session.thinkingLevel;
   options.record.thinking = result.session.thinkingLevel;
@@ -833,7 +899,8 @@ export async function launchTask(options: {
   });
   // Background launches never block the parent Agent tool on foreground wait.
   if (options.spec.background) resolveForegroundReleased();
-  const lifecycle = createChildLifecycleController({
+  const modelChain = buildModelChain(options.spec, options.parent.parentModel);
+  let lifecycle = createChildLifecycleController({
     maxToolCalls: options.spec.maxToolCalls,
     softToolCalls: options.spec.softToolCalls,
     toolBudgetBlock: options.spec.toolBudgetBlock,
@@ -842,7 +909,7 @@ export async function launchTask(options: {
     warningTurns: schedule.warningTurns,
     warningIntervalTurns: schedule.warningIntervalTurns,
   });
-  const usageBaseline: LifecycleUsageBaseline = {
+  let usageBaseline: LifecycleUsageBaseline = {
     turns: record.usage.turns,
     toolCallsRequested: record.usage.toolCallsRequested,
     toolCallsExecuted: record.usage.toolCallsExecuted,
@@ -870,7 +937,7 @@ export async function launchTask(options: {
   let acceptingMessages = true;
   let resolveChildReady!: () => void;
   let rejectChildReady!: (error: unknown) => void;
-  const childReady = new Promise<void>((resolve, reject) => {
+  let childReady = new Promise<void>((resolve, reject) => {
     resolveChildReady = resolve;
     rejectChildReady = reject;
   });
@@ -880,6 +947,7 @@ export async function launchTask(options: {
   const promise = (async () => {
     let messages: AgentMessage[] = [];
     let timeout: ReturnType<typeof setTimeout> | undefined;
+    let attemptIndex = 0;
     try {
       if (options.spec.isolation === "worktree") {
         if (!options.config.enableWorktrees) throw new Error("worktree isolation is disabled by configuration");
@@ -889,88 +957,179 @@ export async function launchTask(options: {
         record.worktreeBranch = worktree.branch;
       }
       if (abortController.signal.aborted) throw new Error("Task was stopped before child startup completed.");
-      childSession = await makeChildSession({
-        spec: options.spec,
-        parent: options.parent,
-        record,
-        config: options.config,
-        agents: options.agents,
-        onComplete: options.onComplete,
-        onProgressWarning: options.onProgressWarning,
-        onTaskStarted: options.onTaskStarted,
-        onLifecycleProgressWarning: handleProgressWarning,
-        deliverNestedResult: async nestedRecord => {
-          if (!childSession) return;
-          const nestedResult = formatTaskOutputForModel(nestedRecord, {
-            bytes: options.config.maxOutputBytes,
-            lines: options.config.maxOutputLines,
+      while (attemptIndex < modelChain.length) {
+        const modelOverride = modelChain[attemptIndex];
+        try {
+          childSession = await makeChildSession({
+            spec: options.spec,
+            parent: options.parent,
+            record,
+            config: options.config,
+            agents: options.agents,
+            onComplete: options.onComplete,
+            onProgressWarning: options.onProgressWarning,
+            onTaskStarted: options.onTaskStarted,
+            onLifecycleProgressWarning: handleProgressWarning,
+            deliverNestedResult: async nestedRecord => {
+              if (!childSession) return;
+              const nestedResult = formatTaskOutputForModel(nestedRecord, {
+                bytes: options.config.maxOutputBytes,
+                lines: options.config.maxOutputLines,
+              });
+              const notification = [
+                "<task-notification>",
+                `<task-id>${escapeXml(nestedRecord.id)}</task-id>`,
+                `<status>${nestedRecord.status}</status>`,
+                `<summary>${escapeXml(nestedRecord.description)}</summary>`,
+                `<output-file>${escapeXml(nestedRecord.outputFile)}</output-file>`,
+                `<result>${escapeXml(nestedResult)}</result>`,
+                "</task-notification>",
+              ].join("\n");
+              if (childSession.isStreaming) await childSession.followUp(notification);
+              else await childSession.prompt(notification, { expandPromptTemplates: false, source: "extension" });
+            },
+            worktree,
+            lifecycle,
+            modelOverride,
           });
-          const notification = [
-            "<task-notification>",
-            `<task-id>${escapeXml(nestedRecord.id)}</task-id>`,
-            `<status>${nestedRecord.status}</status>`,
-            `<summary>${escapeXml(nestedRecord.description)}</summary>`,
-            `<output-file>${escapeXml(nestedRecord.outputFile)}</output-file>`,
-            `<result>${escapeXml(nestedResult)}</result>`,
-            "</task-notification>",
-          ].join("\n");
-          if (childSession.isStreaming) await childSession.followUp(notification);
-          else await childSession.prompt(notification, { expandPromptTemplates: false, source: "extension" });
-        },
-        worktree,
-        lifecycle,
-      });
-      startupComplete = true;
-      if (abortController.signal.aborted) {
-        await childSession.abort();
-        throw new Error("Task was stopped during child startup.");
-      }
-      await persistTask(record);
-      const unsubscribe = childSession.subscribe(event => {
-        if (event.type === "message_end") {
-          messages.push(event.message);
-          if (event.message.role === "assistant") {
-            applyAssistantTokenUsage(record, event.message);
+          startupComplete = true;
+          if (abortController.signal.aborted) {
+            await childSession.abort();
+            throw new Error("Task was stopped during child startup.");
           }
-          const preview = extractFinalText(messages);
-          if (preview) record.preview = preview.split("\n")[0]?.slice(0, 300);
-          applyLifecycleUsage(record, usageBaseline, lifecycle.snapshot.usage);
-          options.onUpdate?.(record);
-        }
-      });
-      const stopChild = () => void childSession?.abort();
-      abortController.signal.addEventListener("abort", stopChild, { once: true });
-      if (abortController.signal.aborted) {
-        await childSession.abort();
-        throw new Error("Task was stopped before prompting the child.");
-      }
-      if (options.spec.timeoutMs !== undefined) {
-        timeout = setTimeout(() => {
-          stopError = `Task timed out after ${options.spec.timeoutMs}ms`;
-          lifecycle.requestStop("timeout");
-          abortController.abort(new Error(stopError));
-        }, options.spec.timeoutMs);
-      }
+          await persistTask(record);
+          const unsubscribe = childSession.subscribe(event => {
+            if (event.type === "message_end") {
+              messages.push(event.message);
+              if (event.message.role === "assistant") {
+                applyAssistantTokenUsage(record, event.message);
+              }
+              const preview = extractFinalText(messages);
+              if (preview) record.preview = preview.split("\n")[0]?.slice(0, 300);
+              applyLifecycleUsage(record, usageBaseline, lifecycle.snapshot.usage);
+              options.onUpdate?.(record);
+            }
+          });
+          const stopChild = () => void childSession?.abort();
+          abortController.signal.addEventListener("abort", stopChild, { once: true });
+          if (abortController.signal.aborted) {
+            await childSession.abort();
+            throw new Error("Task was stopped before prompting the child.");
+          }
+          if (options.spec.timeoutMs !== undefined) {
+            timeout = setTimeout(() => {
+              stopError = `Task timed out after ${options.spec.timeoutMs}ms`;
+              lifecycle.requestStop("timeout");
+              abortController.abort(new Error(stopError));
+            }, options.spec.timeoutMs);
+          }
 
-      const kickoff = options.spec.prompt;
-      const initialPrompt = childSession.prompt(kickoff, { expandPromptTemplates: false, source: "extension" });
-      resolveChildReady();
-      try {
-        await initialPrompt;
-      } finally {
-        acceptingMessages = false;
-        await sendQueue;
-        abortController.signal.removeEventListener("abort", stopChild);
-        unsubscribe();
+          const kickoff = options.spec.prompt;
+          const initialPrompt = childSession.prompt(kickoff, { expandPromptTemplates: false, source: "extension" });
+          resolveChildReady();
+          try {
+            await initialPrompt;
+          } finally {
+            acceptingMessages = false;
+            await sendQueue;
+            abortController.signal.removeEventListener("abort", stopChild);
+            unsubscribe();
+          }
+          // Pi surfaces provider failures (e.g. 503 auth unavailable) as an assistant
+          // error message; the prompt promise itself resolves. Detect the early
+          // no-work provider failure here so the launch can retry with the fallback.
+          // When the model resolution layer already switched to the fallback
+          // (modelFallbackNote set), the current attempt is already using the
+          // fallback; retrying it again would duplicate the fallback attempt.
+          if (attemptIndex < modelChain.length - 1
+            && !stopError
+            && !abortController.signal.aborted
+            && !record.modelFallbackNote
+            && isEarlyProviderError(messages, lifecycle)) {
+            throw new FallbackRetrySignal();
+          }
+          const output = finalizeInvocationRecord({
+            record,
+            lifecycle,
+            baseline: usageBaseline,
+            messages,
+            error: stopError,
+          });
+          await saveTaskOutput(record, output);
+          break;
+        } catch (error) {
+          if (childSession) {
+            childSession.dispose();
+            childSession = undefined;
+          }
+          if (timeout) {
+            clearTimeout(timeout);
+            timeout = undefined;
+          }
+          const isFallbackSignal = error instanceof FallbackRetrySignal;
+          const canTryFallback = attemptIndex < modelChain.length - 1
+            && !stopError
+            && !abortController.signal.aborted;
+          const neverStarted = isFallbackSignal
+            || !startupComplete
+            || (lifecycle.snapshot.usage.toolCallsExecuted === 0
+              && messages.length === 0
+              && !record.preview);
+          const retryable = canTryFallback && neverStarted;
+          if (retryable) {
+            attemptIndex++;
+            messages = [];
+            startupComplete = false;
+            acceptingMessages = true;
+            sendQueue = Promise.resolve();
+            // Clear stale session/model state from the failed attempt so a later
+            // startup failure is not attributed to the disposed primary session.
+            delete record.sessionFile;
+            delete record.preview;
+            record.usage = {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              cost: 0,
+              turns: 0,
+              toolCalls: 0,
+              toolCallsRequested: 0,
+              toolCallsExecuted: 0,
+              toolCallsBlocked: 0,
+            };
+            record.modelFallbackNote = `Primary model attempt failed before doing any work${error instanceof Error && error.message ? ` (${error.message})` : ""}; retried with fallback model.`;
+            lifecycle = createChildLifecycleController({
+              maxToolCalls: options.spec.maxToolCalls,
+              softToolCalls: options.spec.softToolCalls,
+              toolBudgetBlock: options.spec.toolBudgetBlock,
+              maxTurns: options.spec.maxTurns,
+              graceTurns: options.spec.graceTurns,
+              warningTurns: schedule.warningTurns,
+              warningIntervalTurns: schedule.warningIntervalTurns,
+            });
+            usageBaseline = {
+              turns: 0,
+              toolCallsRequested: 0,
+              toolCallsExecuted: 0,
+              toolCallsBlocked: 0,
+            };
+            continue;
+          }
+          rejectChildReady(error);
+          const message = stopError ?? (error instanceof Error ? error.message : String(error));
+          const output = finalizeInvocationRecord({
+            record,
+            lifecycle,
+            baseline: usageBaseline,
+            messages,
+            error: message,
+            startupFailure: !startupComplete,
+          });
+          await saveTaskOutput(record, output);
+          break;
+        }
       }
-      const output = finalizeInvocationRecord({
-        record,
-        lifecycle,
-        baseline: usageBaseline,
-        messages,
-        error: stopError,
-      });
-      await saveTaskOutput(record, output);
     } catch (error) {
       rejectChildReady(error);
       const message = stopError ?? (error instanceof Error ? error.message : String(error));
@@ -1249,7 +1408,20 @@ export async function resumeCompletedTask(options: {
       });
       await loader.reload();
       const sessionManager = SessionManager.open(sessionFile, path.dirname(sessionFile), cwd);
-      const resolved = options.record.model ? resolveCliModel({ cliModel: options.record.model, modelRuntime }) : undefined;
+      let resolvedModel = options.record.model ? resolveCliModel({ cliModel: options.record.model, modelRuntime }) : undefined;
+      if (options.record.model && (resolvedModel?.error || !resolvedModel?.model)) {
+        const primaryError = resolvedModel?.error ?? "unresolved";
+        const fallbackRef = resumeAgent.fallbackModel?.trim();
+        if (fallbackRef && fallbackRef !== options.record.model) {
+          const fallbackResolved = resolveCliModel({ cliModel: fallbackRef, modelRuntime });
+          if (!fallbackResolved.error && fallbackResolved.model) {
+            resolvedModel = fallbackResolved;
+            options.record.modelFallbackNote = `Primary model '${options.record.model}' unavailable (${primaryError}); using fallback '${fallbackRef}'.`;
+            options.record.model = fallbackRef;
+          }
+        }
+      }
+      const resolved = resolvedModel;
       const restoredTools = [...resumeTools];
       const resumeNestedTool = resumeCapabilities.allowNestedAgent && options.agents && options.parent?.taskQuota
         ? createNestedAgentAdapter({

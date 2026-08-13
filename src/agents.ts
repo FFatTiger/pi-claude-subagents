@@ -15,6 +15,8 @@ export interface AgentDefinition {
   tools?: string[];
   disallowedTools?: string[];
   model?: string;
+  /** Model used automatically when the configured model is unavailable at resolution or early startup. */
+  fallbackModel?: string;
   thinking?: string;
   skills?: string[];
   readonly: boolean;
@@ -153,6 +155,7 @@ function parseAgentFile(filePath: string, source: AgentDefinition["source"]): Ag
     tools: parseStringList(frontmatter.tools),
     disallowedTools: parseStringList(frontmatter.disallowedTools),
     model: typeof frontmatter.model === "string" && frontmatter.model.trim() ? frontmatter.model.trim() : undefined,
+    fallbackModel: typeof frontmatter.fallbackModel === "string" && frontmatter.fallbackModel.trim() ? frontmatter.fallbackModel.trim() : undefined,
     thinking: typeof frontmatter.thinking === "string" && frontmatter.thinking.trim() ? frontmatter.thinking.trim() : undefined,
     skills: parseStringList(frontmatter.skills),
     readonly,
@@ -288,6 +291,7 @@ export function applyAgentModelSettings(agents: AgentDefinition[], settings: Age
       return {
         ...agent,
         model: override?.model ?? agent.model ?? settings.defaultModel,
+        fallbackModel: override?.fallbackModel ?? agent.fallbackModel ?? settings.fallbackModel,
         thinking: override?.thinking ?? agent.thinking,
       };
     }),

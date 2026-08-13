@@ -203,3 +203,20 @@ test("resume appends only the supplied invocation segment", async () => {
 
   assert.equal(fs.readFileSync(task.outputFile, "utf8"), "Earlier invocation\n\n---\n\nNew invocation only");
 });
+
+test("fallback note is prepended once and not duplicated on append", async () => {
+  const task = record({ id: "note" });
+  task.modelFallbackNote = "used fallback";
+
+  await appendTaskOutput(task, "first");
+  const once = fs.readFileSync(task.outputFile, "utf8");
+  assert.equal((once.match(/⚠️ used fallback/g) ?? []).length, 1, "note should appear exactly once after first append");
+  assert.match(once, /^> ⚠️ used fallback/);
+
+  // A later resume/appends again must not duplicate the note.
+  await appendTaskOutput(task, "second");
+  const twice = fs.readFileSync(task.outputFile, "utf8");
+  assert.equal((twice.match(/⚠️ used fallback/g) ?? []).length, 1, "note should still appear exactly once after second append");
+  assert.match(twice, /first/);
+  assert.match(twice, /second/);
+});

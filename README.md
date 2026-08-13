@@ -190,6 +190,35 @@ Child skill discovery uses Pi `DefaultResourceLoader` and parent project trust. 
 
 Omit `model` on normal calls. Unknown overrides fail before child startup. Fork always inherits parent model and thinking. Override keys must match runtime names exactly: `general-purpose`, `Explore`, `Plan`, `verification`. Legacy `pi-subagents` names (`scout`, `planner`, `reviewer`, `worker`) are ignored and reported as diagnostics.
 
+### Fallback model
+
+Configure a fallback model that is used automatically when the primary model is unavailable, so a single transient provider outage (for example a 503 auth error on the first model call) does not fail the whole task:
+
+```json
+{
+  "subagents": {
+    "defaultModel": "provider/primary",
+    "fallbackModel": "provider/backup",
+    "agentOverrides": {
+      "verification": { "fallbackModel": "provider/verifier-backup" }
+    }
+  }
+}
+```
+
+Resolution order for `fallbackModel`:
+
+1. `subagents.agentOverrides.<AgentName>.fallbackModel` in Pi user/project `settings.json`
+2. Agent Markdown `fallbackModel` frontmatter
+3. `subagents.fallbackModel` in Pi user/project `settings.json`
+
+Behavior:
+
+- If the resolved primary model cannot be found or authenticated, the fallback is used before the child starts.
+- If the child fails on its very first model call before doing any work (0 turns, no output, no tool calls), the launch is retried once with the fallback model.
+- A fallback that equals the primary reference is ignored; fallback is attempted at most once per task.
+- Successful fallback retries keep the primary-unavailable note in the task error/diagnostic history.
+
 ## Nested agents
 
 A role with `Agent` access may launch a named child. Nested work returns to the direct parent for consolidation.

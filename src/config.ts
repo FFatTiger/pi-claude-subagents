@@ -6,10 +6,14 @@ import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 export interface AgentModelOverride {
   model?: string;
   thinking?: string;
+  /** Model used automatically when the primary model is unavailable at resolution or early startup. */
+  fallbackModel?: string;
 }
 
 export interface AgentModelSettings {
   defaultModel?: string;
+  /** Global fallback model used when an agent's configured model is unavailable. */
+  fallbackModel?: string;
   agentOverrides: Record<string, AgentModelOverride>;
   sourcePath: string;
 }
@@ -91,6 +95,10 @@ function parseAgentModelSettings(raw: Record<string, unknown>, sourcePath: strin
     if (typeof value.defaultModel === "string" && value.defaultModel.trim()) settings.defaultModel = value.defaultModel.trim();
     else diagnostics.push(`${sourcePath}: subagents.defaultModel must be a non-empty string`);
   }
+  if (value.fallbackModel !== undefined) {
+    if (typeof value.fallbackModel === "string" && value.fallbackModel.trim()) settings.fallbackModel = value.fallbackModel.trim();
+    else diagnostics.push(`${sourcePath}: subagents.fallbackModel must be a non-empty string`);
+  }
   const overrides = value.agentOverrides;
   if (overrides === undefined) return settings;
   if (!overrides || typeof overrides !== "object" || Array.isArray(overrides)) {
@@ -108,11 +116,15 @@ function parseAgentModelSettings(raw: Record<string, unknown>, sourcePath: strin
       if (typeof candidate.model === "string" && candidate.model.trim()) override.model = candidate.model.trim();
       else diagnostics.push(`${sourcePath}: subagents.agentOverrides.${name}.model must be a non-empty string`);
     }
+    if (candidate.fallbackModel !== undefined) {
+      if (typeof candidate.fallbackModel === "string" && candidate.fallbackModel.trim()) override.fallbackModel = candidate.fallbackModel.trim();
+      else diagnostics.push(`${sourcePath}: subagents.agentOverrides.${name}.fallbackModel must be a non-empty string`);
+    }
     if (candidate.thinking !== undefined) {
       if (typeof candidate.thinking === "string" && candidate.thinking.trim()) override.thinking = candidate.thinking.trim();
       else diagnostics.push(`${sourcePath}: subagents.agentOverrides.${name}.thinking must be a non-empty string`);
     }
-    if (override.model || override.thinking) settings.agentOverrides[name] = override;
+    if (override.model || override.thinking || override.fallbackModel) settings.agentOverrides[name] = override;
   }
   return settings;
 }
@@ -137,10 +149,15 @@ export function loadAgentModelSettings(cwd: string, includeProject: boolean, age
     diagnostics.push(error instanceof Error ? error.message : String(error));
   }
   const project = parseAgentModelSettings(projectRaw, projectPath, diagnostics);
+  const mergedOverrides: Record<string, AgentModelOverride> = { ...global.agentOverrides };
+  for (const [name, override] of Object.entries(project.agentOverrides)) {
+    mergedOverrides[name] = { ...global.agentOverrides[name], ...override };
+  }
   return {
     settings: {
       defaultModel: project.defaultModel ?? global.defaultModel,
-      agentOverrides: { ...global.agentOverrides, ...project.agentOverrides },
+      fallbackModel: project.fallbackModel ?? global.fallbackModel,
+      agentOverrides: mergedOverrides,
       sourcePath: project.defaultModel || Object.keys(project.agentOverrides).length ? projectPath : globalPath,
     },
     diagnostics,

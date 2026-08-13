@@ -75,6 +75,8 @@ export interface TaskRecord {
   effectiveTools?: string[];
   effectiveReadonly?: boolean;
   effectiveShellPolicy?: "inspect" | "verify" | "unrestricted";
+  /** Diagnostic note recorded when a configured primary model was unavailable and a fallback was used. */
+  modelFallbackNote?: string;
   error?: string;
   preview?: string;
   usage: TaskUsage;
@@ -227,11 +229,15 @@ export async function persistTask(record: TaskRecord): Promise<void> {
 }
 
 export async function saveTaskOutput(record: TaskRecord, output: string): Promise<void> {
+  const note = record.modelFallbackNote?.trim();
+  const finalOutput = note ? `> ⚠️ ${note}
+
+${output.trim() ? output : "(Subagent completed without new text output.)"}` : output;
   await withFileMutationQueue(record.outputFile, async () => {
     await fs.promises.mkdir(path.dirname(record.outputFile), { recursive: true });
-    await fs.promises.writeFile(record.outputFile, output, "utf8");
+    await fs.promises.writeFile(record.outputFile, finalOutput, "utf8");
   });
-  record.preview = output.trim().split("\n").find(Boolean)?.slice(0, 300) || "(no output)";
+  record.preview = finalOutput.trim().split("\n").find(Boolean)?.slice(0, 300) || "(no output)";
   await persistTask(record);
 }
 
@@ -242,8 +248,15 @@ export async function appendTaskOutput(record: TaskRecord, output: string): Prom
   } catch {
     // First output segment.
   }
-  const combined = prior.trim()
-    ? `${prior.trimEnd()}\n\n---\n\n${output}`
+  const note = record.modelFallbackNote?.trim();
+  // Strip any previously-prepended fallback note so it is not duplicated on resume/appends.
+  const noteLine = note ? `> ⚠️ ${note}` : "";
+  let priorBody = prior;
+  if (noteLine && priorBody.startsWith(`${noteLine}\n\n`)) {
+    priorBody = priorBody.slice(noteLine.length + 2);
+  }
+  const combined = priorBody.trim()
+    ? `${priorBody.trimEnd()}\n\n---\n\n${output}`
     : output;
   await saveTaskOutput(record, combined);
 }

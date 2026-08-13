@@ -163,6 +163,10 @@ Nested agents execute synchronously inside their direct parent AgentSession and 
 
 The runtime deliberately trusts child roles with the capabilities selected by their role inventory. Bundled roles request full available tools and unrestricted Bash; Explore, Plan, and verification remain non-modifying only by strict prompt instruction. This is not a security sandbox. Use OS permissions, containers, VMs, or equivalent process isolation for untrusted models or tasks.
 
+### Model fallback
+
+An agent may declare a `fallbackModel` (frontmatter, global `subagents.fallbackModel`, or per-agent override). The launch builds an ordered model chain from the resolved primary reference plus a distinct fallback. Two independent layers use it: model resolution falls back to the declared fallback when the primary cannot be found or authenticated, and the runtime launch loop retries once with the fallback when a child fails on its first model call before performing any work (0 turns, no output, no tool calls) — the transient provider-outage case such as a 503 auth error. Retry rebuilds the child lifecycle and usage baseline; budgets, warnings, stop semantics, and the foreground-release race are unchanged.
+
 Runtime-enforced controls are:
 
 - explicit custom role tool selection and parent-inventory intersection

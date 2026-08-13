@@ -8,7 +8,8 @@ import { applyAgentModelSettings, discoverAgents, findAgent } from "../src/agent
 import { agentAllowsNestedAgents, resolveAgentTools } from "../src/capabilities.ts";
 import { applyConfig, DEFAULT_CONFIG, loadAgentModelSettings } from "../src/config.ts";
 import { buildAgentToolDescription, buildParentPolicy, classifyDispatch, resolveTaskIsolation } from "../src/prompts.ts";
-import { createFreshChildSessionManager, createTaskQuota, finalNewTurnText, prepareForkSession, validateAgentDefinition } from "../src/runtime.ts";
+import { createChildLifecycleController } from "../src/lifecycle.ts";
+import { createFreshChildSessionManager, createTaskQuota, finalNewTurnText, prepareForkSession, validateAgentDefinition, buildModelChain, isEarlyProviderError } from "../src/runtime.ts";
 import { formatTaskOutputForModel, type TaskRecord } from "../src/tasks.ts";
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -140,26 +141,125 @@ test("applies settings model overrides and reports stale role names", () => {
   const discovered = agents();
   const applied = applyAgentModelSettings(discovered, {
     defaultModel: "provider/default",
+    fallbackModel: "provider/fallback",
     agentOverrides: {
-      verification: { model: "provider/verifier", thinking: "high" },
+      verification: { model: "provider/verifier", thinking: "high", fallbackModel: "provider/verifier-fallback" },
       reviewer: { model: "provider/legacy" },
     },
     sourcePath: "/tmp/settings.json",
   });
   assert.equal(findAgent(applied.agents, "verification")?.model, "provider/verifier");
   assert.equal(findAgent(applied.agents, "verification")?.thinking, "high");
+  assert.equal(findAgent(applied.agents, "verification")?.fallbackModel, "provider/verifier-fallback");
   assert.equal(findAgent(applied.agents, "Plan")?.model, "provider/default");
+  assert.equal(findAgent(applied.agents, "Plan")?.fallbackModel, "provider/fallback");
   assert.match(applied.diagnostics.join("\n"), /reviewer.*ignored/);
 });
 
-test("loads user subagent model settings", () => {
+test("loads user subagent model settings with global and per-agent fallback", () => {
   const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agent-settings-"));
   const settingsPath = path.join(agentDir, "settings.json");
-  fs.writeFileSync(settingsPath, JSON.stringify({ subagents: { defaultModel: "provider/default", agentOverrides: { Explore: { model: "provider/explore" } } } }));
+  fs.writeFileSync(settingsPath, JSON.stringify({ subagents: { defaultModel: "provider/default", fallbackModel: "provider/fallback", agentOverrides: { Explore: { model: "provider/explore", fallbackModel: "provider/explore-fallback" } } } }));
   const loaded = loadAgentModelSettings(agentDir, false, agentDir);
   assert.equal(loaded.settings.defaultModel, "provider/default");
+  assert.equal(loaded.settings.fallbackModel, "provider/fallback");
   assert.equal(loaded.settings.agentOverrides.Explore?.model, "provider/explore");
+  assert.equal(loaded.settings.agentOverrides.Explore?.fallbackModel, "provider/explore-fallback");
 });
+
+test("frontmatter fallbackModel is parsed and inherited through settings", () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agent-fallback-"));
+  const dir = path.join(cwd, ".pi", "agents");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "worker.md"), `---\nname: worker\ndescription: Full worker\nmodel: provider/primary\nfallbackModel: provider/worker-fallback\n---\nWorker prompt\n`);
+  const agent = findAgent(discoverAgents({ cwd, packageRoot, includeProject: true }).agents, "worker");
+  assert.equal(agent?.model, "provider/primary");
+  assert.equal(agent?.fallbackModel, "provider/worker-fallback");
+  // Frontmatter fallback is retained when no override or global fallback is closer.
+  const applied = applyAgentModelSettings([agent!], {
+    defaultModel: "provider/default",
+    fallbackModel: "provider/global-fallback",
+    agentOverrides: {},
+    sourcePath: "/tmp/settings.json",
+  });
+  assert.equal(findAgent(applied.agents, "worker")?.fallbackModel, "provider/worker-fallback");
+  const appliedPerAgent = applyAgentModelSettings([agent!], {
+    defaultModel: "provider/default",
+    fallbackModel: "provider/global-fallback",
+    agentOverrides: { worker: { fallbackModel: "provider/worker-settings-fallback" } },
+    sourcePath: "/tmp/settings.json",
+  });
+  assert.equal(findAgent(appliedPerAgent.agents, "worker")?.fallbackModel, "provider/worker-settings-fallback");
+});
+
+test("model fallback chain uses configured fallback distinct from primary", () => {
+  const base = findAgent(agents(), "general-purpose")!;
+  const spec = (model: string | undefined, fallbackModel: string | undefined, forked = false) => ({
+    agent: { ...base, model, fallbackModel },
+    forked,
+    model: undefined,
+  } as never);
+  // No fallback configured -> single default attempt.
+  assert.deepEqual(buildModelChain(spec("provider/a", undefined)), [undefined]);
+  // Distinct fallback -> primary resolution then forced fallback attempt.
+  assert.deepEqual(buildModelChain(spec("provider/a", "provider/b")), [undefined, "provider/b"]);
+  // Fallback equal to primary -> no redundant second attempt.
+  assert.deepEqual(buildModelChain(spec("provider/a", "provider/a")), [undefined]);
+  // Frontmatter fallback only, no primary model -> fallback still adds an attempt.
+  assert.deepEqual(buildModelChain(spec(undefined, "provider/b")), [undefined, "provider/b"]);
+});
+
+test("model fallback chain respects explicit call model and fork parent model", () => {
+  const base = findAgent(agents(), "general-purpose")!;
+  // Explicit call model A, agent model B with fallback B -> primary is A, fallback B is distinct.
+  const explicit = ({
+    agent: { ...base, model: "provider/b", fallbackModel: "provider/b" },
+    forked: false,
+    model: "provider/a",
+  } as never);
+  assert.deepEqual(buildModelChain(explicit), [undefined, "provider/b"]);
+  // Fork inheriting parent model A, agent model B with fallback B -> primary is A, fallback B distinct.
+  const fork = ({
+    agent: { ...base, model: "provider/b", fallbackModel: "provider/b" },
+    forked: true,
+    model: undefined,
+  } as never);
+  assert.deepEqual(buildModelChain(fork, "provider/a"), [undefined, "provider/b"]);
+  // Inherited primary equals fallback B (parent model B) -> no redundant attempt.
+  const inheritEqual = ({
+    agent: { ...base, model: undefined, fallbackModel: "provider/b" },
+    forked: false,
+    model: undefined,
+  } as never);
+  assert.deepEqual(buildModelChain(inheritEqual, "provider/b"), [undefined]);
+});
+
+test("early provider error detection ignores real work and normal turns", () => {
+  const empty = createChildLifecycleController({});
+  assert.equal(isEarlyProviderError([], empty), false);
+  // A provider error message (stopReason error + errorMessage) with no tool calls and no text.
+  const errorMessage = {
+    role: "assistant",
+    content: [{ type: "text", text: "" }],
+    stopReason: "error",
+    errorMessage: "503: auth_unavailable",
+  } as never;
+  assert.equal(isEarlyProviderError([errorMessage], empty), true);
+  // Normal assistant text is not an early provider error.
+  const normalMessage = {
+    role: "assistant",
+    content: [{ type: "text", text: "hello" }],
+    stopReason: "stop",
+  } as never;
+  assert.equal(isEarlyProviderError([normalMessage], empty), false);
+  // A message with tool calls executed is not treated as early failure.
+  const busy = createChildLifecycleController({});
+  busy.onTurnStart();
+  const toolAdmission = busy.admitTool("bash");
+  assert.equal(toolAdmission.allowed, true);
+  assert.equal(isEarlyProviderError([errorMessage], busy), false);
+});
+
 
 test("parent policy encodes routing fan-out continuation fork verification and nesting", () => {
   const prompt = buildParentPolicy(agents(), DEFAULT_CONFIG);
