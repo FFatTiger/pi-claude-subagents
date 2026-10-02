@@ -252,6 +252,8 @@ Lifecycle enforcement includes:
 - Warnings reach the root parent without stopping the child, restricting tools, or changing task status
 - A warning is not a failure, timeout, or proof of a stall; repeated/empty preview alone is insufficient reason to stop. Decide from the warning's counters and latest stage note, continue while turns/tool counters advance, and reserve `TaskStop` for explicit cancellation, dangerous/duplicate work, or repeated fresh evidence that useful progress stopped. Use `TaskOutput` only for an explicit user status request or missing detail
 - A foreground task is promoted to supervised background execution on its first warning so the parent can inspect, steer, or stop it
+- A launch containing foreground tasks reserves all of its slots before starting any child. Insufficient capacity returns an explicit error with no tasks started, so a partially launched array cannot block its own checkpoint delivery.
+- A failed resume preparation preserves the previous execution and its unsent final notification. Only durable preparation commits the new execution; progress previews then start fresh.
 - Optional soft `maxTurns` + grace window for explicit unattended policy (default grace 1)
 - Optional hard `maxToolCalls` that blocks only configured tools (default `read`, `grep`, `find`, `ls`)
 - Explicit termination kinds: `normal`, `turn_budget`, `tool_budget`, `timeout`, `manual_stop`, `parent_shutdown`, `provider_error`, `startup_error`

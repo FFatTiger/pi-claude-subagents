@@ -742,6 +742,12 @@ export default function register(pi: ExtensionAPI): void {
       } catch (error) {
         return taskResult([], error instanceof Error ? error.message : String(error), true);
       }
+      // A foreground array must never hold a running child's slot while
+      // waiting to launch another child: its checkpoint could not return.
+      let reservedSlots = specs.some((spec) => !spec.background) ? specs.length : 0;
+      if (reservedSlots > 0 && !taskQuota.tryAcquire(reservedSlots)) {
+        return taskResult([], `Not enough free task slots for this foreground launch (${reservedSlots} required; ${taskQuota.limit - taskQuota.inUse} available). No tasks were started. Split the launch or wait for running tasks to finish.`, true);
+      }
       const launched: LiveTask[] = [];
       const invocations = new Map<string, number>();
       let foregroundReturned = false;
@@ -760,7 +766,8 @@ export default function register(pi: ExtensionAPI): void {
         try {
           for (const spec of specs) {
             if (signal?.aborted) throw new Error("Agent launch aborted before all child tasks started.");
-            await taskQuota.acquire(1, signal ?? undefined);
+            if (reservedSlots > 0) reservedSlots--;
+            else await taskQuota.acquire(1, signal ?? undefined);
             heldPermit = true;
             try {
               const task = await launchTask({
@@ -825,6 +832,9 @@ export default function register(pi: ExtensionAPI): void {
             return `### ${task.record.description}\nstatus: running (supervised background)\ntask_id: ${task.record.id}\noutput_file: ${task.record.outputFile}\nturns: ${task.record.usage.turns}\nnext_warning_turn: ${task.record.nextWarningTurn ?? "n/a"}\nstage: ${task.record.preview ?? "No stage output yet"}\ntool_calls_executed: ${task.record.usage.toolCallsExecuted}\n\nForeground wait released by a scheduled supervision checkpoint. The child is still running and holds its concurrency slot until actual completion. This is not a timeout or failure; a repeated or empty preview can coexist with active thinking/tool work. Completion and subsequent checkpoints arrive as parent notifications at your next tool gap. Continue by default while counters advance, use SendMessage when supported, and reserve TaskStop for explicit cancellation, danger/duplication, or repeated fresh evidence that useful progress has stopped. Use TaskOutput only for an explicit user status request or when a notification lacks needed detail.`;
           }
           if (task.record.status !== "running") {
+            if (task.record.completedAt === undefined) {
+              return `### ${task.record.description}\nFinal output is still being saved. Completion will notify you when ready.\ntask_id: ${task.record.id}`;
+            }
             const result = formatTaskOutputForModel(task.record, { bytes: currentConfig.maxOutputBytes, lines: currentConfig.maxOutputLines });
             notifiers.ackObservedFinal(task.record.id);
             return `### ${task.record.description}\n${result}`;
@@ -839,6 +849,7 @@ export default function register(pi: ExtensionAPI): void {
         });
         return taskResult(launched.map(task => task.record), summaries.join("\n\n"));
       } finally {
+        if (reservedSlots > 0) taskQuota.release(reservedSlots);
         signal?.removeEventListener("abort", abortBlocking);
       }
     },
@@ -887,11 +898,18 @@ export default function register(pi: ExtensionAPI): void {
         return taskResult([record], error instanceof Error ? error.message : String(error), true);
       }
       try {
-        // A new execution identity: queued notifications from the previous invocation are
-        // discarded, and its late callbacks can no longer settle or re-notify this resume.
-        const invocation = notifiers.beginInvocation(record.id);
+        // Preparation works on a separate record. Only a successful initial
+        // persistence commits the new notification generation; failed resume
+        // must leave the prior record and its pending final result intact.
+        let invocation: number | undefined;
+        const resumeRecord = structuredClone(record);
         const resumed = await resumeCompletedTask({
-          record,
+          record: resumeRecord,
+          onPrepared: () => {
+            invocation = notifiers.beginInvocation(record.id);
+            known.set(record.id, resumeRecord);
+            quotaTasks.add(record.id);
+          },
           message: params.message,
           agent,
           agents: currentAgents,
@@ -912,9 +930,8 @@ export default function register(pi: ExtensionAPI): void {
           onComplete: r => notifyCompletion(r, r.id === record.id ? invocation : undefined),
           onProgressWarning: (r, details) => notifyProgressWarning(r, details, r.id === record.id ? invocation : undefined),
         });
-        live.set(record.id, resumed);
-        quotaTasks.add(record.id);
-        return taskResult([record], `Resumed ${record.description} in background.`);
+        if (resumed.record.completedAt === undefined) live.set(record.id, resumed);
+        return taskResult([resumed.record], `Resumed ${record.description} in background.`);
       } catch (error) {
         taskQuota.release();
         return taskResult([record], error instanceof Error ? error.message : String(error), true);

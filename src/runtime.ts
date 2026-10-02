@@ -1249,6 +1249,8 @@ export function applyResumeCapabilities(
 }
 
 export async function resumeCompletedTask(options: {
+  /** Called after preparation is durable and before child execution can emit callbacks. */
+  onPrepared?: () => void;
   record: TaskRecord;
   message: string;
   agent: AgentDefinition;
@@ -1355,7 +1357,9 @@ export async function resumeCompletedTask(options: {
   options.record.background = true;
   options.record.error = undefined;
   options.record.completedAt = undefined;
+  options.record.preview = undefined;
   await persistTask(options.record);
+  options.onPrepared?.();
   const promise = (async () => {
     const messages: AgentMessage[] = [];
     try {
@@ -1458,6 +1462,8 @@ export async function resumeCompletedTask(options: {
         if (event.type !== "message_end") return;
         messages.push(event.message);
         if (event.message.role === "assistant") applyAssistantTokenUsage(options.record, event.message);
+        const preview = extractFinalText(messages);
+        if (preview) options.record.preview = preview.split("\n")[0]?.slice(0, 300);
         applyLifecycleUsage(options.record, usageBaseline, lifecycle.snapshot.usage);
       });
       stopChild = () => void childSession?.abort();
