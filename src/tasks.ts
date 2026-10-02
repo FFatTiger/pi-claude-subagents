@@ -66,6 +66,8 @@ export interface TaskRecord {
   forkSystemPrompt?: string;
   sessionFile?: string;
   outputFile: string;
+  /** Character offset of the latest invocation in the complete output archive. */
+  latestOutputStart?: number;
   taskFile: string;
   worktreePath?: string;
   worktreeCwd?: string;
@@ -228,7 +230,7 @@ export async function persistTask(record: TaskRecord): Promise<void> {
   });
 }
 
-export async function saveTaskOutput(record: TaskRecord, output: string): Promise<void> {
+export async function saveTaskOutput(record: TaskRecord, output: string, latestOutputStart = 0): Promise<void> {
   const note = record.modelFallbackNote?.trim();
   const finalOutput = note ? `> ⚠️ ${note}
 
@@ -237,7 +239,8 @@ ${output.trim() ? output : "(Subagent completed without new text output.)"}` : o
     await fs.promises.mkdir(path.dirname(record.outputFile), { recursive: true });
     await fs.promises.writeFile(record.outputFile, finalOutput, "utf8");
   });
-  record.preview = finalOutput.trim().split("\n").find(Boolean)?.slice(0, 300) || "(no output)";
+  record.latestOutputStart = latestOutputStart + (note ? `> ⚠️ ${note}\n\n`.length : 0);
+  record.preview = finalOutput.slice(record.latestOutputStart).trim().split("\n").find(Boolean)?.slice(0, 300) || "(no output)";
   await persistTask(record);
 }
 
@@ -255,10 +258,8 @@ export async function appendTaskOutput(record: TaskRecord, output: string): Prom
   if (noteLine && priorBody.startsWith(`${noteLine}\n\n`)) {
     priorBody = priorBody.slice(noteLine.length + 2);
   }
-  const combined = priorBody.trim()
-    ? `${priorBody.trimEnd()}\n\n---\n\n${output}`
-    : output;
-  await saveTaskOutput(record, combined);
+  const prefix = priorBody.trim() ? `${priorBody.trimEnd()}\n\n---\n\n` : "";
+  await saveTaskOutput(record, `${prefix}${output}`, prefix.length);
 }
 
 export function extractFinalText(messages: AgentMessage[]): string {
@@ -461,7 +462,7 @@ export function formatTaskOutputForModel(
 ): string {
   let output = "";
   try {
-    output = fs.readFileSync(record.outputFile, "utf8");
+    output = fs.readFileSync(record.outputFile, "utf8").slice(record.latestOutputStart ?? 0);
   } catch {
     output = record.error || record.preview || "(no output yet)";
   }

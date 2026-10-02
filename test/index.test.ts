@@ -19,7 +19,7 @@ import register, {
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { createTaskQuota, type ProgressWarningDetails } from "../src/runtime.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { LiveTask, TaskRecord } from "../src/tasks.ts";
+import { appendTaskOutput, formatTaskOutputForModel, saveTaskOutput, type LiveTask, type TaskRecord } from "../src/tasks.ts";
 
 function partialTask(): TaskRecord {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-index-test-"));
@@ -57,6 +57,24 @@ function partialTask(): TaskRecord {
     },
   };
 }
+
+test("resumed output reads the latest handoff while retaining the complete archive", async (t) => {
+  const record = partialTask();
+  t.after(() => fs.rmSync(record.cwd, { recursive: true, force: true }));
+  record.modelFallbackNote = "fallback model selected";
+  await saveTaskOutput(record, "old result 中文".repeat(1000));
+  await appendTaskOutput(record, "new result\n\n---\n\nwith its own separator");
+  assert.equal(formatTaskOutputForModel(record, { bytes: 200, lines: 20 }), "new result\n\n---\n\nwith its own separator");
+  assert.equal(record.preview, "new result");
+  const saved = JSON.parse(fs.readFileSync(record.taskFile, "utf8")) as TaskRecord;
+  assert.equal(formatTaskOutputForModel(saved, 200), "new result\n\n---\n\nwith its own separator");
+  const archive = fs.readFileSync(record.outputFile, "utf8");
+  assert.match(archive, /old result 中文/);
+  assert.match(archive, /new result/);
+  assert.equal(archive.split("fallback model selected").length, 2);
+  await appendTaskOutput(record, "third result");
+  assert.equal(formatTaskOutputForModel(record, 200), "third result");
+});
 
 test("public Agent schemas require explicit supervision and omit hard budgets", () => {
   const topLevel = AgentParams as unknown as { properties: Record<string, unknown>; required?: string[] };

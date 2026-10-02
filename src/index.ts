@@ -947,11 +947,12 @@ export default function register(pi: ExtensionAPI): void {
       // Returning a final result means the parent has now seen this invocation's outcome:
       // drop its queued notification so the same result is not delivered twice. A running
       // (partial) snapshot never swallows the eventual completion notification.
-      const result = taskResult([current], `status: ${current.status}\ntask_id: ${current.id}\noutput_file: ${current.outputFile}\n\n${formatTaskOutputForModel(current, {
-        bytes: currentConfig.maxOutputBytes,
-        lines: currentConfig.maxOutputLines,
-      })}`);
-      if (current.status !== "running") notifiers.ackObservedFinal(current.id);
+      const finalOutputSaving = current.status !== "running" && liveTask !== undefined && current.completedAt === undefined;
+      const output = finalOutputSaving
+        ? "Final output is still being saved. The completion notification will deliver it when ready."
+        : formatTaskOutputForModel(current, { bytes: currentConfig.maxOutputBytes, lines: currentConfig.maxOutputLines });
+      const result = taskResult([current], `status: ${current.status}\ntask_id: ${current.id}\noutput_file: ${current.outputFile}\n\n${output}`);
+      if (current.status !== "running" && !finalOutputSaving) notifiers.ackObservedFinal(current.id);
       return result;
     },
   });

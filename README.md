@@ -112,6 +112,8 @@ TUI and RPC default to background. Print and JSON modes run synchronously. Backg
 
 `TaskOutput` is for explicit user status requests, interruption recovery, or diagnosis — not a routine follow-up to automatic notifications (which already carry the result). If the result is required before the next step, launch with `run_in_background: false`.
 
+After a task resumes, notifications and `TaskOutput` read the latest execution's output. The output file still retains the complete archive; the persisted task record stores the start of the latest result so a long earlier result cannot hide the new one. If final output is still being saved, `TaskOutput` reports that state and leaves completion delivery pending.
+
 ## Built-in roles
 
 | Agent | Role |
