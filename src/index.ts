@@ -277,6 +277,8 @@ export function createBackgroundNotifiers(deps: BackgroundNotifierDeps): Backgro
   const { pi } = deps;
   const pending = new Map<string, PendingEntry>();
   const generations = new Map<string, number>();
+  const terminal = new Set<string>();
+  const observedFinal = new Set<string>();
   const foregroundHeld = new Set<string>();
   const lastWarnedPreview = new Map<string, string>();
   let parentBusy = false;
@@ -297,7 +299,7 @@ export function createBackgroundNotifiers(deps: BackgroundNotifierDeps): Backgro
     flushScheduled = true;
     queueMicrotask(() => {
       flushScheduled = false;
-      flushPending();
+      if (!parentBusy) flushPending();
     });
   };
 
@@ -305,11 +307,12 @@ export function createBackgroundNotifiers(deps: BackgroundNotifierDeps): Backgro
     // A late callback from a superseded execution must not settle or re-notify the current one.
     if (invocation !== undefined && invocation !== generations.get(record.id)) return;
     if (!deps.completionDeduper.shouldHandle(record.id)) return;
+    terminal.add(record.id);
     if (deps.quotaTasks.delete(record.id)) deps.taskQuota.release();
     deps.known.set(record.id, record);
     deps.live.delete(record.id);
     // Nested completions stay with the direct parent; root-only delivery for background tasks.
-    if (record.parentTaskId || !record.background || disposed) return;
+    if (record.parentTaskId || !record.background || disposed || observedFinal.has(record.id)) return;
     const config = deps.config();
     const result = formatTaskOutputForModel(record, {
       bytes: config.maxOutputBytes,
@@ -329,8 +332,8 @@ export function createBackgroundNotifiers(deps: BackgroundNotifierDeps): Backgro
 
   const notifyProgressWarning = (record: TaskRecord, details: ProgressWarningDetails, invocation?: number) => {
     if (invocation !== undefined && invocation !== generations.get(record.id)) return;
+    if (disposed || terminal.has(record.id) || record.status !== "running") return;
     deps.known.set(record.id, record);
-    if (disposed) return;
     // The warning that releases a blocked foreground Agent wait is already carried by
     // that tool call's result summary; sending it again here would double-report it.
     if (foregroundHeld.delete(record.id)) return;
@@ -356,6 +359,8 @@ export function createBackgroundNotifiers(deps: BackgroundNotifierDeps): Backgro
       const invocation = (generations.get(taskId) ?? 0) + 1;
       generations.set(taskId, invocation);
       deps.completionDeduper.beginInvocation(taskId);
+      terminal.delete(taskId);
+      observedFinal.delete(taskId);
       pending.delete(taskId);
       lastWarnedPreview.delete(taskId);
       foregroundHeld.delete(taskId);
@@ -368,6 +373,8 @@ export function createBackgroundNotifiers(deps: BackgroundNotifierDeps): Backgro
       foregroundHeld.delete(taskId);
     },
     ackObservedFinal(taskId) {
+      terminal.add(taskId);
+      observedFinal.add(taskId);
       pending.delete(taskId);
     },
     flushPending,
@@ -737,6 +744,7 @@ export default function register(pi: ExtensionAPI): void {
       }
       const launched: LiveTask[] = [];
       const invocations = new Map<string, number>();
+      let foregroundReturned = false;
       let heldPermit = false;
       // Parent Stop aborts the tool signal. Keep one listener for launch + foreground wait
       // so there is no gap between startup and the blocking race (the old pi-web Stop hole).
@@ -761,7 +769,12 @@ export default function register(pi: ExtensionAPI): void {
                 config: currentConfig,
                 agents: currentAgents,
                 onComplete: record => handleTaskCompletion(record, invocations.get(record.id)),
-                onProgressWarning: (record, details) => notifyProgressWarning(record, details, invocations.get(record.id)),
+                onProgressWarning: (record, details) => {
+                  // Set the hold before notification, including warnings that arrive
+                  // while another task in this launch is still acquiring its slot.
+                  if (!spec.background && !record.parentTaskId && !foregroundReturned) notifiers.holdForegroundWarning(record.id);
+                  notifyProgressWarning(record, details, invocations.get(record.id));
+                },
                 onTaskStarted: nested => {
                   known.set(nested.record.id, nested.record);
                   live.set(nested.record.id, nested);
@@ -805,10 +818,16 @@ export default function register(pi: ExtensionAPI): void {
           if (!task.record.background) notifiers.holdForegroundWarning(task.record.id);
         }
         await waitForLaunchedForegroundTasks(launched, signal ?? undefined);
+        foregroundReturned = true;
         for (const task of launched) notifiers.releaseForegroundWarning(task.record.id);
         const summaries = launched.map(task => {
           if (task.record.status === "running" && task.record.lastWarningTurn !== undefined) {
-            return `### ${task.record.description}\nstatus: running (supervised background)\ntask_id: ${task.record.id}\noutput_file: ${task.record.outputFile}\nturns: ${task.record.usage.turns}\nnext_warning_turn: ${task.record.nextWarningTurn ?? "n/a"}\n\nForeground wait released by a scheduled supervision checkpoint. The child is still running and holds its concurrency slot until actual completion. This is not a timeout or failure; a repeated or empty preview can coexist with active thinking/tool work. Completion and subsequent checkpoints arrive as parent notifications at your next tool gap. Continue by default while counters advance, use SendMessage when supported, and reserve TaskStop for explicit cancellation, danger/duplication, or repeated fresh evidence that useful progress has stopped. Use TaskOutput only for an explicit user status request or when a notification lacks needed detail.`;
+            return `### ${task.record.description}\nstatus: running (supervised background)\ntask_id: ${task.record.id}\noutput_file: ${task.record.outputFile}\nturns: ${task.record.usage.turns}\nnext_warning_turn: ${task.record.nextWarningTurn ?? "n/a"}\nstage: ${task.record.preview ?? "No stage output yet"}\ntool_calls_executed: ${task.record.usage.toolCallsExecuted}\n\nForeground wait released by a scheduled supervision checkpoint. The child is still running and holds its concurrency slot until actual completion. This is not a timeout or failure; a repeated or empty preview can coexist with active thinking/tool work. Completion and subsequent checkpoints arrive as parent notifications at your next tool gap. Continue by default while counters advance, use SendMessage when supported, and reserve TaskStop for explicit cancellation, danger/duplication, or repeated fresh evidence that useful progress has stopped. Use TaskOutput only for an explicit user status request or when a notification lacks needed detail.`;
+          }
+          if (task.record.status !== "running") {
+            const result = formatTaskOutputForModel(task.record, { bytes: currentConfig.maxOutputBytes, lines: currentConfig.maxOutputLines });
+            notifiers.ackObservedFinal(task.record.id);
+            return `### ${task.record.description}\n${result}`;
           }
           if (task.record.background) {
             return `Async agent launched successfully.\ntask_id: ${task.record.id} (internal operational ID; do not mention it to the user)\noutput_file: ${task.record.outputFile}\nThe agent is running in the background and completion will be delivered automatically. Progress warnings are automatic supervision checkpoints; do not sleep, poll TaskOutput in a loop, or duplicate this task. Continue only with non-overlapping work, or briefly tell the user what was launched and end the turn.`;
@@ -928,11 +947,12 @@ export default function register(pi: ExtensionAPI): void {
       // Returning a final result means the parent has now seen this invocation's outcome:
       // drop its queued notification so the same result is not delivered twice. A running
       // (partial) snapshot never swallows the eventual completion notification.
-      if (current.status !== "running") notifiers.ackObservedFinal(current.id);
-      return taskResult([current], `status: ${current.status}\ntask_id: ${current.id}\noutput_file: ${current.outputFile}\n\n${formatTaskOutputForModel(current, {
+      const result = taskResult([current], `status: ${current.status}\ntask_id: ${current.id}\noutput_file: ${current.outputFile}\n\n${formatTaskOutputForModel(current, {
         bytes: currentConfig.maxOutputBytes,
         lines: currentConfig.maxOutputLines,
       })}`);
+      if (current.status !== "running") notifiers.ackObservedFinal(current.id);
+      return result;
     },
   });
 

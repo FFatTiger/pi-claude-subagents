@@ -430,6 +430,43 @@ test("ackObservedFinal drops pending delivery for the current invocation without
   assert.match(String(h.sent[0]!.message.content), /<status>stopped<\/status>/);
 });
 
+test("final read before the completion callback suppresses delivery but still records the terminal state", () => {
+  const h = notifierHarness();
+  h.onAgentStart();
+  const invocation = h.beginInvocation("task-a");
+  h.ackObservedFinal("task-a");
+  h.notifyCompletion(completedTask("task-a"), invocation);
+  h.onTurnEnd();
+  assert.equal(h.sent.length, 0);
+  assert.equal(h.known.get("task-a")?.status, "completed");
+  h.notifyProgressWarning(runningTask("task-a"), WARNING_DETAILS, invocation);
+  h.onTurnEnd();
+  assert.equal(h.known.get("task-a")?.status, "completed");
+  assert.equal(h.sent.length, 0);
+});
+
+test("late warnings cannot revive a completion after it was flushed", () => {
+  const h = notifierHarness();
+  h.onAgentStart();
+  const invocation = h.beginInvocation("task-a");
+  h.notifyCompletion(completedTask("task-a"), invocation);
+  h.onTurnEnd();
+  h.notifyProgressWarning(runningTask("task-a"), WARNING_DETAILS, invocation);
+  h.onTurnEnd();
+  assert.equal(h.sent.length, 1);
+  assert.equal(h.known.get("task-a")?.status, "completed");
+});
+
+test("an idle flush scheduled before a parent starts waits for that parent's tool gap", async () => {
+  const h = notifierHarness();
+  h.notifyCompletion(completedTask("task-a"));
+  h.onAgentStart();
+  await drainMicrotasks();
+  assert.equal(h.sent.length, 0);
+  h.onTurnEnd();
+  assert.equal(h.sent.length, 1);
+});
+
 test("resume generation: the new execution notifies, a late old callback is dropped entirely", async () => {
   const h = notifierHarness();
   const first = completedTask("task-a");
