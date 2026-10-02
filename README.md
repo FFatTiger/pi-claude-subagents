@@ -76,7 +76,7 @@ Uses Pi `SessionManager.createBranchedSession()`. The child gets the parent conv
 
 ### Parallel fan-out
 
-TUI and RPC default to background. Print and JSON modes run synchronously. Background completion arrives as a parent follow-up notification — do not poll `TaskOutput`.
+TUI and RPC default to background. Print and JSON modes run synchronously. Background completion and progress warnings are buffered per task and delivered as one steered parent notification at the next tool gap (or as one merged turn when the parent is idle) — do not poll `TaskOutput`.
 
 ```json
 {
@@ -110,7 +110,7 @@ TUI and RPC default to background. Print and JSON modes run synchronously. Backg
 { "task_id": "task-id" }
 ```
 
-`TaskOutput` is for explicit status requests or diagnosis. If the result is required before the next step, launch with `run_in_background: false`.
+`TaskOutput` is for explicit user status requests, interruption recovery, or diagnosis — not a routine follow-up to automatic notifications (which already carry the result). If the result is required before the next step, launch with `run_in_background: false`.
 
 ## Built-in roles
 
@@ -248,7 +248,7 @@ Lifecycle enforcement includes:
 - Long-running children are instructed to emit a one- or two-sentence stage note after meaningful phases and at least every 8–12 tool-using turns, giving the parent fresher visible progress without making supervision warnings frequent
 - Mandatory recurring progress supervision follows the chosen checkpoints
 - Warnings reach the root parent without stopping the child, restricting tools, or changing task status
-- A warning is not a failure, timeout, or proof of a stall; repeated/empty preview alone is insufficient reason to stop. Inspect once with `TaskOutput`, continue while turns/tool counters advance, and reserve `TaskStop` for explicit cancellation, dangerous/duplicate work, or repeated fresh evidence that useful progress stopped
+- A warning is not a failure, timeout, or proof of a stall; repeated/empty preview alone is insufficient reason to stop. Decide from the warning's counters and latest stage note, continue while turns/tool counters advance, and reserve `TaskStop` for explicit cancellation, dangerous/duplicate work, or repeated fresh evidence that useful progress stopped. Use `TaskOutput` only for an explicit user status request or missing detail
 - A foreground task is promoted to supervised background execution on its first warning so the parent can inspect, steer, or stop it
 - Optional soft `maxTurns` + grace window for explicit unattended policy (default grace 1)
 - Optional hard `maxToolCalls` that blocks only configured tools (default `read`, `grep`, `find`, `ls`)

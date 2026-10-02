@@ -61,7 +61,8 @@ test("parent policy requires task-specific recurring progress supervision", () =
   assert.match(policy, /stage note.*8-12 tool-using turns/is);
   assert.match(policy, /preview may be stale or empty|preview.*stale or empty/is);
   assert.match(policy, /Do not call TaskStop merely because elapsed time is long or the preview repeats/i);
-  assert.match(policy, /inspect once with TaskOutput/i);
+  assert.match(policy, /carries the counters and latest stage note needed to decide/i);
+  assert.match(policy, /TaskOutput only for an explicit user status request/i);
 });
 
 test("short Agent description tells the caller how to choose supervision values", () => {
@@ -75,6 +76,8 @@ test("short Agent description tells the caller how to choose supervision values"
   assert.match(description, /scope or risk materially differs/i);
   assert.match(description, /stage notes during long work/i);
   assert.match(description, /preview alone is not evidence of a stall/i);
-  assert.match(description, /TaskOutput.*continue.*SendMessage.*TaskStop/is);
+  assert.match(description, /decide from the warning's counters and latest stage note.*continue when work is progressing.*SendMessage/is);
+  assert.match(description, /TaskOutput is for explicit user status requests or missing detail/i);
+  assert.doesNotMatch(description, /inspect once with TaskOutput/i);
   assert.doesNotMatch(description, /normally 30|normally 20|30\/20/);
 });

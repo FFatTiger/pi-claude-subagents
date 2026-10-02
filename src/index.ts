@@ -201,47 +201,198 @@ export interface BackgroundNotifierDeps {
   live: Map<string, LiveTask>;
 }
 
+/** One queued XML notification block. Task records and persisted files remain the authority. */
+export interface PendingNotificationItem {
+  kind: "completion" | "warning";
+  record: TaskRecord;
+  content: string;
+  progressWarning?: ProgressWarningDetails;
+}
+
+export interface NotificationMessageDraft {
+  customType: string;
+  content: string;
+  display: boolean;
+  details: unknown;
+}
+
+/** Wrap queued blocks into one message. A single item keeps the legacy per-kind customType and details shape so existing renderers stay compatible; multiple items use the batch type. */
+export function buildNotificationMessage(items: PendingNotificationItem[]): NotificationMessageDraft {
+  if (items.length === 1) {
+    const item = items[0]!;
+    return {
+      customType: item.kind === "completion" ? "pi-subagent-notification" : "pi-subagent-progress-warning",
+      content: item.content,
+      display: true,
+      details: item.kind === "completion" ? item.record : { ...item.record, progressWarning: item.progressWarning },
+    };
+  }
+  return {
+    customType: "pi-subagent-notification-batch",
+    content: items.map(item => item.content).join("\n\n"),
+    display: true,
+    details: { items: items.map(({ kind, record, progressWarning }) => ({ kind, record, progressWarning })) },
+  };
+}
+
+interface PendingEntry {
+  kind: "completion" | "warning";
+  taskId: string;
+  invocation: number;
+  content: string;
+  record: TaskRecord;
+  progressWarning?: ProgressWarningDetails;
+}
+
+export interface BackgroundNotifiers {
+  notifyCompletion(record: TaskRecord, invocation?: number): void;
+  notifyProgressWarning(record: TaskRecord, details: ProgressWarningDetails, invocation?: number): void;
+  /** Open a new execution identity for a task; late callbacks from older invocations are dropped. */
+  beginInvocation(taskId: string): number;
+  /** Mark a task as held in a foreground Agent wait: its first warning arrives via that tool's result. */
+  holdForegroundWarning(taskId: string): void;
+  releaseForegroundWarning(taskId: string): void;
+  /** TaskOutput returned the final result of the current invocation; drop its queued delivery. */
+  ackObservedFinal(taskId: string): void;
+  flushPending(): void;
+  onAgentStart(): void;
+  onTurnEnd(): void;
+  onAgentSettled(): void;
+  onSessionShutdown(): void;
+}
+
 /**
- * Parent-facing completion and progress-warning delivery. Both run on background
- * paths (task promise finalization, child turn_end) that no runner handler
- * guards, so their sends go through sendParentNotification.
+ * Parent-facing completion and progress-warning delivery.
+ *
+ * Notifications are buffered per task in this owner (Pi cannot revoke already
+ * enqueued messages) and flushed as one steer message at the parent's next
+ * tool gap (turn_end, before the next request) or, when the parent is idle, on
+ * a coalesced microtask that triggers a new turn. A completion replaces a
+ * still-pending warning for the same execution; warnings never revive after a
+ * terminal result. Runs happen on background paths (task promise finalization,
+ * child turn_end) that no runner handler guards, so sends go through
+ * sendParentNotification and only the exact stale-ctx contract is swallowed.
  */
-export function createBackgroundNotifiers(deps: BackgroundNotifierDeps): {
-  notifyCompletion: (record: TaskRecord) => void;
-  notifyProgressWarning: (record: TaskRecord, details: ProgressWarningDetails) => void;
-} {
+export function createBackgroundNotifiers(deps: BackgroundNotifierDeps): BackgroundNotifiers {
   const { pi } = deps;
-  const notifyCompletion = (record: TaskRecord) => {
+  const pending = new Map<string, PendingEntry>();
+  const generations = new Map<string, number>();
+  const foregroundHeld = new Set<string>();
+  const lastWarnedPreview = new Map<string, string>();
+  let parentBusy = false;
+  let disposed = false;
+  let flushScheduled = false;
+
+  const flushPending = () => {
+    if (disposed || pending.size === 0) return;
+    const items = [...pending.values()];
+    pending.clear();
+    // Steer while the parent streams (consumed at the next tool gap); triggerTurn
+    // starts or defers a turn cleanly when the parent is idle or mid-settlement.
+    sendParentNotification(pi, buildNotificationMessage(items), { triggerTurn: true, deliverAs: "steer" });
+  };
+
+  const scheduleIdleFlush = () => {
+    if (disposed || parentBusy || flushScheduled) return;
+    flushScheduled = true;
+    queueMicrotask(() => {
+      flushScheduled = false;
+      flushPending();
+    });
+  };
+
+  const notifyCompletion = (record: TaskRecord, invocation?: number) => {
+    // A late callback from a superseded execution must not settle or re-notify the current one.
+    if (invocation !== undefined && invocation !== generations.get(record.id)) return;
     if (!deps.completionDeduper.shouldHandle(record.id)) return;
     if (deps.quotaTasks.delete(record.id)) deps.taskQuota.release();
     deps.known.set(record.id, record);
     deps.live.delete(record.id);
     // Nested completions stay with the direct parent; root-only delivery for background tasks.
-    if (record.parentTaskId || !record.background) return;
+    if (record.parentTaskId || !record.background || disposed) return;
     const config = deps.config();
     const result = formatTaskOutputForModel(record, {
       bytes: config.maxOutputBytes,
       lines: config.maxOutputLines,
     });
-    sendParentNotification(pi, {
-      customType: "pi-subagent-notification",
+    // The terminal result supersedes any not-yet-delivered warning for the same execution.
+    pending.set(record.id, {
+      kind: "completion",
+      taskId: record.id,
+      invocation: generations.get(record.id) ?? 0,
       content: taskNotification(record, result),
-      display: true,
-      details: record,
-    }, { triggerTurn: true, deliverAs: "followUp" });
+      record,
+    });
+    lastWarnedPreview.delete(record.id);
+    scheduleIdleFlush();
   };
 
-  const notifyProgressWarning = (record: TaskRecord, details: ProgressWarningDetails) => {
+  const notifyProgressWarning = (record: TaskRecord, details: ProgressWarningDetails, invocation?: number) => {
+    if (invocation !== undefined && invocation !== generations.get(record.id)) return;
     deps.known.set(record.id, record);
-    sendParentNotification(pi, {
-      customType: "pi-subagent-progress-warning",
-      content: progressWarningNotification(record, details),
-      display: true,
-      details: { ...record, progressWarning: details },
-    }, { triggerTurn: true, deliverAs: "followUp" });
+    if (disposed) return;
+    // The warning that releases a blocked foreground Agent wait is already carried by
+    // that tool call's result summary; sending it again here would double-report it.
+    if (foregroundHeld.delete(record.id)) return;
+    if (pending.get(record.id)?.kind === "completion") return;
+    const previousPreview = lastWarnedPreview.get(record.id);
+    const previewUnchanged = previousPreview !== undefined && previousPreview === (record.preview ?? "");
+    lastWarnedPreview.set(record.id, record.preview ?? "");
+    pending.set(record.id, {
+      kind: "warning",
+      taskId: record.id,
+      invocation: generations.get(record.id) ?? 0,
+      content: progressWarningNotification(record, details, { previewUnchanged }),
+      record,
+      progressWarning: details,
+    });
+    scheduleIdleFlush();
   };
 
-  return { notifyCompletion, notifyProgressWarning };
+  return {
+    notifyCompletion,
+    notifyProgressWarning,
+    beginInvocation(taskId) {
+      const invocation = (generations.get(taskId) ?? 0) + 1;
+      generations.set(taskId, invocation);
+      deps.completionDeduper.beginInvocation(taskId);
+      pending.delete(taskId);
+      lastWarnedPreview.delete(taskId);
+      foregroundHeld.delete(taskId);
+      return invocation;
+    },
+    holdForegroundWarning(taskId) {
+      if (!disposed) foregroundHeld.add(taskId);
+    },
+    releaseForegroundWarning(taskId) {
+      foregroundHeld.delete(taskId);
+    },
+    ackObservedFinal(taskId) {
+      pending.delete(taskId);
+    },
+    flushPending,
+    onAgentStart() {
+      parentBusy = true;
+    },
+    onTurnEnd() {
+      // Tool results are complete and the next request has not started: a steer
+      // queued now is consumed exactly at that next tool gap.
+      flushPending();
+    },
+    onAgentSettled() {
+      parentBusy = false;
+      // Deliver leftovers from runs that ended without another turn_end; Pi defers
+      // the triggered turn until settlement completes.
+      flushPending();
+    },
+    onSessionShutdown() {
+      disposed = true;
+      parentBusy = false;
+      flushScheduled = false;
+      pending.clear();
+      foregroundHeld.clear();
+    },
+  };
 }
 
 export function formatTaskDiagnostic(record: TaskRecord): string {
@@ -283,7 +434,7 @@ export function progressWarningNotification(record: TaskRecord, details: {
   warningCount: number;
   warningTurns: number;
   warningIntervalTurns: number;
-}): string {
+}, options?: { previewUnchanged?: boolean }): string {
   const usage = record.usage;
   const startedMs = Date.parse(record.startedAt);
   const elapsedMs = Number.isFinite(startedMs) ? Math.max(0, Date.now() - startedMs) : 0;
@@ -300,8 +451,10 @@ export function progressWarningNotification(record: TaskRecord, details: {
     `<checkpoint turn="${details.turn}" next="${details.nextWarningTurn}" count="${details.warningCount}" first="${details.warningTurns}" interval="${details.warningIntervalTurns}"/>`,
     `<usage><turns>${usage.turns}</turns><tool_calls_requested>${usage.toolCallsRequested}</tool_calls_requested><tool_calls_executed>${usage.toolCallsExecuted}</tool_calls_executed><tool_calls_blocked>${usage.toolCallsBlocked}</tool_calls_blocked></usage>`,
     `<elapsed_seconds>${elapsedSec}</elapsed_seconds>`,
+    ...(options?.previewUnchanged ? ["<preview_state>unchanged since the previous checkpoint</preview_state>"] : []),
     `<preview>${xmlText(preview)}</preview>`,
-    "<guidance>This is a scheduled supervision checkpoint, not a failure, timeout, or proof of a stall. The preview can be stale or empty while the child is actively thinking or using tools. Inspect current state once with TaskOutput before acting. Continue by default when turns or tool counters are advancing. Use SendMessage when the live role supports steering. Do not call TaskStop merely because elapsed time is long or the preview repeats; stop only for explicit user cancellation, dangerous or duplicate work, or fresh evidence across repeated checkpoints that useful progress has stopped. Do not poll in a loop.</guidance>",
+    `<output-file>${xmlText(record.outputFile)}</output-file>`,
+    "<guidance>This is a scheduled supervision checkpoint, not a failure, timeout, or proof of a stall. The preview is the child's latest stage note and can be stale or empty while it is actively thinking or using tools; the turn and tool counters above show real activity. Decide from this notification: continue by default while counters advance, and use SendMessage to steer when the live role supports it. Do not call TaskStop merely because elapsed time is long or the preview repeats; stop only for explicit user cancellation, dangerous or duplicate work, or fresh evidence across repeated checkpoints that useful progress has stopped. Use TaskOutput only for an explicit user status request, interruption recovery, or when this notification lacks the detail you need; do not poll in a loop.</guidance>",
     "</progress-warning>",
   ].filter(Boolean).join("\n");
 }
@@ -421,7 +574,7 @@ export default function register(pi: ExtensionAPI): void {
   const taskQuota = createTaskQuota(currentConfig.maxConcurrentTasks);
   const quotaTasks = new Set<string>();
   const completionDeduper = createCompletionDeduper();
-  const { notifyCompletion, notifyProgressWarning } = createBackgroundNotifiers({
+  const notifiers = createBackgroundNotifiers({
     pi,
     config: () => currentConfig,
     taskQuota,
@@ -430,6 +583,7 @@ export default function register(pi: ExtensionAPI): void {
     known,
     live,
   });
+  const { notifyCompletion, notifyProgressWarning } = notifiers;
 
   const reload = (ctx: ExtensionContext) => {
     const includeProject = ctx.isProjectTrusted();
@@ -465,10 +619,10 @@ export default function register(pi: ExtensionAPI): void {
     live.delete(record.id);
   };
 
-  const handleTaskCompletion = (record: TaskRecord) => {
+  const handleTaskCompletion = (record: TaskRecord, invocation?: number) => {
     // Ordinary foreground completion returns through the tool call. Once the first warning
     // promotes it to background, final completion must be delivered to the root parent.
-    if (record.background) notifyCompletion(record);
+    if (record.background) notifyCompletion(record, invocation);
     else finalizeForegroundTask(record);
   };
 
@@ -490,7 +644,14 @@ export default function register(pi: ExtensionAPI): void {
     };
   });
 
+  // Keep the notifier's parent-busy state consistent with the Pi agent loop so buffered
+  // notifications flush into the next tool gap instead of waiting out the whole turn.
+  pi.on("agent_start", () => notifiers.onAgentStart());
+  pi.on("turn_end", () => notifiers.onTurnEnd());
+  pi.on("agent_settled", () => notifiers.onAgentSettled());
+
   pi.on("session_shutdown", () => {
+    notifiers.onSessionShutdown();
     for (const task of live.values()) void task.stop("parent_shutdown");
     live.clear();
   });
@@ -517,6 +678,25 @@ export default function register(pi: ExtensionAPI): void {
     return new Text(`${theme.fg("warning", "⚠")} ${theme.bold(label)} ${theme.fg("dim", `progress warning @ turn ${turn}; next ${next}`)}`, 0, 0);
   });
 
+  pi.registerMessageRenderer<{ items: Array<{ kind: "completion" | "warning"; record: TaskRecord; progressWarning?: { turn?: number; nextWarningTurn?: number } }> }>("pi-subagent-notification-batch", (message, _options, theme) => {
+    const items = message.details?.items ?? [];
+    const lines = items.map(item => {
+      if (item.kind === "warning") {
+        const turn = item.progressWarning?.turn ?? item.record.lastWarningTurn ?? "?";
+        const next = item.progressWarning?.nextWarningTurn ?? item.record.nextWarningTurn ?? "?";
+        return `${theme.fg("warning", "⚠")} ${theme.bold(item.record.description)} ${theme.fg("dim", `progress warning @ turn ${turn}; next ${next}`)}`;
+      }
+      const record = item.record;
+      const icon = record.status === "completed"
+        ? theme.fg("success", "✓")
+        : record.status === "partial" || record.status === "stopped"
+          ? theme.fg("warning", record.status === "partial" ? "◐" : "■")
+          : theme.fg("error", "✗");
+      return `${icon} ${theme.bold(record.description)} ${theme.fg("dim", record.status)}`;
+    });
+    return new Text(lines.length ? lines.join("\n") : "Subagent notifications", 0, 0);
+  });
+
   pi.registerTool({
     name: "Agent",
     label: "Agent",
@@ -527,7 +707,7 @@ export default function register(pi: ExtensionAPI): void {
       "Delegate implementation needing more than a couple of edits, isolation, broad validation, or substantial intermediate tool output unless it is tightly scoped and direct execution is clearly cheaper.",
       "Named agents start Fresh. Explain the goal and why, known evidence and ruled-out paths, exact files/errors, scope, success criteria, validation, and expected response. Never delegate understanding: synthesize research into concrete implementation instructions.",
       "In interactive Pi, Agent launches in the background by default. Do not poll, peek, duplicate, or predict the result. Continue only non-overlapping work, or briefly state what is running and end the turn.",
-      "Use subagent_type: fork only for root-session work that needs the persisted conversation and decisions. The default and general warning schedule is 40 turns first, then every 25 turns; choose a different pair only when the assignment materially fits the documented scope/risk ranges. Tasks-array children inherit the top-level policy unless their risk differs materially. Children emit short stage notes during long work. A progress warning is not a failure or timeout, and repeated/empty preview alone is not a stall signal: inspect once with TaskOutput, continue when counters advance, use SendMessage when supported, and reserve TaskStop for explicit cancellation, danger/duplication, or repeated fresh evidence of no useful progress.",
+      "Use subagent_type: fork only for root-session work that needs the persisted conversation and decisions. The default and general warning schedule is 40 turns first, then every 25 turns; choose a different pair only when the assignment materially fits the documented scope/risk ranges. Tasks-array children inherit the top-level policy unless their risk differs materially. Children emit short stage notes during long work. A progress warning is not a failure or timeout, and repeated/empty preview alone is not a stall signal: decide from the warning's counters and latest stage preview, continue while counters advance, use SendMessage when supported, and reserve TaskStop for explicit cancellation, danger/duplication, or repeated fresh evidence of no useful progress. Use TaskOutput only for an explicit user status request or when a notification lacks needed detail.",
     ],
     description: buildAgentToolDescription(currentAgents, currentConfig),
     parameters: AgentParams,
@@ -556,6 +736,7 @@ export default function register(pi: ExtensionAPI): void {
         return taskResult([], error instanceof Error ? error.message : String(error), true);
       }
       const launched: LiveTask[] = [];
+      const invocations = new Map<string, number>();
       let heldPermit = false;
       // Parent Stop aborts the tool signal. Keep one listener for launch + foreground wait
       // so there is no gap between startup and the blocking race (the old pi-web Stop hole).
@@ -579,8 +760,8 @@ export default function register(pi: ExtensionAPI): void {
                 parent,
                 config: currentConfig,
                 agents: currentAgents,
-                onComplete: handleTaskCompletion,
-                onProgressWarning: notifyProgressWarning,
+                onComplete: record => handleTaskCompletion(record, invocations.get(record.id)),
+                onProgressWarning: (record, details) => notifyProgressWarning(record, details, invocations.get(record.id)),
                 onTaskStarted: nested => {
                   known.set(nested.record.id, nested.record);
                   live.set(nested.record.id, nested);
@@ -590,7 +771,7 @@ export default function register(pi: ExtensionAPI): void {
               });
               known.set(task.record.id, task.record);
               live.set(task.record.id, task);
-              completionDeduper.beginInvocation(task.record.id);
+              invocations.set(task.record.id, notifiers.beginInvocation(task.record.id));
               quotaTasks.add(task.record.id);
               launched.push(task);
               heldPermit = false;
@@ -618,10 +799,16 @@ export default function register(pi: ExtensionAPI): void {
         }
         // First progress warning releases the foreground wait while the child keeps running.
         // Outer abort listener remains attached; helper also observes signal for already-aborted.
+        // Held foreground tasks surface their releasing checkpoint in this tool call's result,
+        // so the notifier suppresses the duplicate notification for it.
+        for (const task of launched) {
+          if (!task.record.background) notifiers.holdForegroundWarning(task.record.id);
+        }
         await waitForLaunchedForegroundTasks(launched, signal ?? undefined);
+        for (const task of launched) notifiers.releaseForegroundWarning(task.record.id);
         const summaries = launched.map(task => {
           if (task.record.status === "running" && task.record.lastWarningTurn !== undefined) {
-            return `### ${task.record.description}\nstatus: running (supervised background)\ntask_id: ${task.record.id}\noutput_file: ${task.record.outputFile}\nturns: ${task.record.usage.turns}\nnext_warning_turn: ${task.record.nextWarningTurn ?? "n/a"}\n\nForeground wait released by a scheduled supervision checkpoint. The child is still running and holds its concurrency slot until actual completion. This is not a timeout or failure; a repeated or empty preview can coexist with active thinking/tool work. Completion and subsequent checkpoints arrive as follow-up messages. Inspect once with TaskOutput if needed, continue by default while counters advance, use SendMessage when supported, and reserve TaskStop for explicit cancellation, danger/duplication, or repeated fresh evidence that useful progress has stopped.`;
+            return `### ${task.record.description}\nstatus: running (supervised background)\ntask_id: ${task.record.id}\noutput_file: ${task.record.outputFile}\nturns: ${task.record.usage.turns}\nnext_warning_turn: ${task.record.nextWarningTurn ?? "n/a"}\n\nForeground wait released by a scheduled supervision checkpoint. The child is still running and holds its concurrency slot until actual completion. This is not a timeout or failure; a repeated or empty preview can coexist with active thinking/tool work. Completion and subsequent checkpoints arrive as parent notifications at your next tool gap. Continue by default while counters advance, use SendMessage when supported, and reserve TaskStop for explicit cancellation, danger/duplication, or repeated fresh evidence that useful progress has stopped. Use TaskOutput only for an explicit user status request or when a notification lacks needed detail.`;
           }
           if (task.record.background) {
             return `Async agent launched successfully.\ntask_id: ${task.record.id} (internal operational ID; do not mention it to the user)\noutput_file: ${task.record.outputFile}\nThe agent is running in the background and completion will be delivered automatically. Progress warnings are automatic supervision checkpoints; do not sleep, poll TaskOutput in a loop, or duplicate this task. Continue only with non-overlapping work, or briefly tell the user what was launched and end the turn.`;
@@ -681,7 +868,9 @@ export default function register(pi: ExtensionAPI): void {
         return taskResult([record], error instanceof Error ? error.message : String(error), true);
       }
       try {
-        completionDeduper.beginInvocation(record.id);
+        // A new execution identity: queued notifications from the previous invocation are
+        // discarded, and its late callbacks can no longer settle or re-notify this resume.
+        const invocation = notifiers.beginInvocation(record.id);
         const resumed = await resumeCompletedTask({
           record,
           message: params.message,
@@ -701,8 +890,8 @@ export default function register(pi: ExtensionAPI): void {
             live.set(nested.record.id, nested);
             quotaTasks.add(nested.record.id);
           },
-          onComplete: notifyCompletion,
-          onProgressWarning: notifyProgressWarning,
+          onComplete: r => notifyCompletion(r, r.id === record.id ? invocation : undefined),
+          onProgressWarning: (r, details) => notifyProgressWarning(r, details, r.id === record.id ? invocation : undefined),
         });
         live.set(record.id, resumed);
         quotaTasks.add(record.id);
@@ -717,7 +906,7 @@ export default function register(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "TaskOutput",
     label: "Task Output",
-    description: "Read a child task snapshot or explicitly wait for completion. Background completion and progress warnings are delivered automatically. A progress warning legitimizes one TaskOutput inspection, then deliberate continue/SendMessage/TaskStop — not a polling loop. Use block waits only when the user explicitly requests status or for operational diagnosis.",
+    description: "Read a child task snapshot or explicitly wait for completion. Background completion and progress warnings are delivered automatically with the information needed to decide, so do not re-check a task whose result a notification already delivered. Use this tool for an explicit user status request, interruption recovery, or operational diagnosis — not as a routine follow-up to automatic notifications. Use block waits only when the user explicitly requests status or for diagnosis.",
     parameters: TaskOutputParams,
     executionMode: "parallel",
     async execute(_id, params, signal) {
@@ -736,6 +925,10 @@ export default function register(pi: ExtensionAPI): void {
         ]);
       }
       const current = known.get(record.id) ?? liveTask?.record ?? record;
+      // Returning a final result means the parent has now seen this invocation's outcome:
+      // drop its queued notification so the same result is not delivered twice. A running
+      // (partial) snapshot never swallows the eventual completion notification.
+      if (current.status !== "running") notifiers.ackObservedFinal(current.id);
       return taskResult([current], `status: ${current.status}\ntask_id: ${current.id}\noutput_file: ${current.outputFile}\n\n${formatTaskOutputForModel(current, {
         bytes: currentConfig.maxOutputBytes,
         lines: currentConfig.maxOutputLines,
@@ -758,6 +951,9 @@ export default function register(pi: ExtensionAPI): void {
       await task.stop("manual_stop");
       const stopped = await task.promise;
       const current = known.get(stopped.id) ?? stopped;
+      // The stop result already carries the final output; drop the queued completion
+      // notification for this invocation so it is not delivered twice.
+      notifiers.ackObservedFinal(current.id);
       return taskResult([current], `Stopped ${current.description}.\n${formatTaskOutputForModel(current, {
         bytes: currentConfig.maxOutputBytes,
         lines: currentConfig.maxOutputLines,
