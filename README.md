@@ -2,7 +2,7 @@
 
 Pi package for multi-agent orchestration: specialist roles, inherited-context workers, parallel investigation, background completion, continuation, verification, and bounded nesting — all on Pi-native sessions, tools, and lifecycle.
 
-Compatible with Pi packages around **0.80.10**. MIT license.
+Compatible with Pi packages **>= 1.0.0 < 2** (verified against 1.0.0). MIT license.
 
 ## Install
 
@@ -326,7 +326,12 @@ Child session JSONL lives in Pi's standard session catalogue (`<getAgentDir()>/s
 
 ## Develop / validate
 
-Requirements: Node.js `>=22.19.0`.
+Requirements: Node.js `>=22.19.0` and Pi packages `>= 1.0.0 < 2` (peer range; verified against 1.0.0).
+
+Pi 1.0 compatibility notes:
+
+- Pi >= 1.0 persists the session file as soon as the first user message exists. `subagent_type: fork` therefore works from the first persisted user turn; a parent branch that has only in-memory setup entries (for example thinking-level changes) is still rejected as non-durable.
+- Background completion and progress-warning notifications are delivered through a send helper that recognizes Pi's stale-extension-ctx contract (`This extension ctx is stale after session replacement or reload.`). If the parent session was replaced or reloaded while a child was running, the already-persisted task record survives and the stale notification is dropped instead of crashing the parent process. Any other send error remains observable and is never swallowed.
 
 ```bash
 npm run check

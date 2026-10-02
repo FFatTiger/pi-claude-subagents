@@ -6,13 +6,18 @@ import * as path from "node:path";
 import register, {
   AgentParams,
   TaskSpecSchema,
+  createBackgroundNotifiers,
   createCompletionDeduper,
   formatTaskDiagnostic,
   inheritTaskWarningPolicy,
+  isStaleExtensionContextError,
   progressWarningNotification,
   taskNotification,
   waitForLaunchedForegroundTasks,
 } from "../src/index.ts";
+import { DEFAULT_CONFIG } from "../src/config.ts";
+import { createTaskQuota, type ProgressWarningDetails } from "../src/runtime.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { LiveTask, TaskRecord } from "../src/tasks.ts";
 
 function partialTask(): TaskRecord {
@@ -263,4 +268,153 @@ test("abort during in-flight launch is recovered by post-push aborted recheck pa
   // production stop is lifecycle-idempotent. Require at least one stop and terminal status.
   assert.ok(stopped >= 1);
   assert.equal(task.record.status, "stopped");
+});
+
+// --- Background parent-notification delivery (stale parent ctx contract) ---
+
+const STALE_CTX_MESSAGE = "This extension ctx is stale after session replacement or reload. Do not use a captured pi or command ctx after ctx.newSession(), ctx.fork(), ctx.switchSession(), or ctx.reload().";
+
+const WARNING_DETAILS: ProgressWarningDetails = {
+  turn: 40,
+  nextWarningTurn: 65,
+  warningCount: 1,
+  warningTurns: 40,
+  warningIntervalTurns: 25,
+};
+
+type ParentPi = Pick<ExtensionAPI, "sendMessage">;
+type SentCall = { message: { customType: string; content: unknown; display: boolean; details: unknown }; options: unknown };
+
+function notifierHarness(onSend?: (message: SentCall["message"]) => void) {
+  const sent: SentCall[] = [];
+  const pi = {
+    sendMessage(message: SentCall["message"], options: unknown) {
+      sent.push({ message, options });
+      onSend?.(message);
+    },
+  } as ParentPi;
+  const known = new Map<string, TaskRecord>();
+  const taskQuota = createTaskQuota(4);
+  const notifiers = createBackgroundNotifiers({
+    pi,
+    config: () => DEFAULT_CONFIG,
+    taskQuota,
+    quotaTasks: new Set<string>(),
+    completionDeduper: createCompletionDeduper(),
+    known,
+    live: new Map<string, LiveTask>(),
+  });
+  return { sent, known, taskQuota, ...notifiers };
+}
+
+function notifiersWithPi(pi: ParentPi) {
+  return createBackgroundNotifiers({
+    pi,
+    config: () => DEFAULT_CONFIG,
+    taskQuota: createTaskQuota(4),
+    quotaTasks: new Set<string>(),
+    completionDeduper: createCompletionDeduper(),
+    known: new Map<string, TaskRecord>(),
+    live: new Map<string, LiveTask>(),
+  });
+}
+
+test("stale ctx detection matches exactly the runner invalidate contract", () => {
+  assert.equal(isStaleExtensionContextError(new Error(STALE_CTX_MESSAGE)), true);
+  assert.equal(isStaleExtensionContextError(new Error(`${STALE_CTX_MESSAGE} with extra trailing context`)), true);
+  // Near-miss messages must not be treated as the stale contract.
+  assert.equal(isStaleExtensionContextError(new Error("This extension ctx was stale after session replacement or reload.")), false);
+  assert.equal(isStaleExtensionContextError(new Error("This extension ctx is stale after session replacement or reload (no period)")), false);
+  assert.equal(isStaleExtensionContextError(new Error("Extension ctx is stale")), false);
+  assert.equal(isStaleExtensionContextError(STALE_CTX_MESSAGE), false);
+  assert.equal(isStaleExtensionContextError(undefined), false);
+});
+
+test("background completion survives a stale parent ctx without unhandled rejection", async () => {
+  const notifiers = notifiersWithPi({ sendMessage() { throw new Error(STALE_CTX_MESSAGE); } });
+  const record = { ...partialTask(), status: "completed" as const };
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    // Fire-and-forget like the runtime's background completion path (task promise finally).
+    void Promise.resolve().then(() => notifiers.notifyCompletion(record));
+    await new Promise(resolve => setTimeout(resolve, 25));
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+  assert.deepEqual(unhandled, []);
+});
+
+test("progress warning send survives a stale parent ctx", () => {
+  const notifiers = notifiersWithPi({ sendMessage() { throw new Error(STALE_CTX_MESSAGE); } });
+  const record = { ...partialTask(), status: "running" as const };
+  assert.doesNotThrow(() => notifiers.notifyProgressWarning(record, WARNING_DETAILS));
+  assert.equal(record.background, true);
+});
+
+test("background notifications keep real send failures observable", async () => {
+  const notifiers = notifiersWithPi({ sendMessage() { throw new Error("renderer queue exploded"); } });
+  const record = { ...partialTask(), status: "completed" as const };
+  await assert.rejects(
+    Promise.resolve().then(() => notifiers.notifyCompletion(record)),
+    /renderer queue exploded/,
+  );
+  assert.throws(() => notifiers.notifyProgressWarning({ ...partialTask(), status: "running" as const }, WARNING_DETAILS), /renderer queue exploded/);
+});
+
+test("near-miss stale messages are not swallowed by background notifiers", async () => {
+  const notifiers = notifiersWithPi({ sendMessage() { throw new Error("This extension ctx was stale after session replacement or reload."); } });
+  await assert.rejects(
+    Promise.resolve().then(() => notifiers.notifyCompletion({ ...partialTask(), status: "completed" as const })),
+    /was stale after session replacement/,
+  );
+});
+
+test("successful background notifications preserve content, options, and bookkeeping", () => {
+  const harness = notifierHarness();
+  const record = { ...partialTask(), status: "completed" as const };
+  const quotaTasks = new Set<string>([record.id]);
+  harness.taskQuota.tryAcquire();
+  const tracked = createBackgroundNotifiers({
+    pi: {
+      sendMessage(message: SentCall["message"], options: unknown) {
+        harness.sent.push({ message, options });
+      },
+    } as ParentPi,
+    config: () => DEFAULT_CONFIG,
+    taskQuota: harness.taskQuota,
+    quotaTasks,
+    completionDeduper: createCompletionDeduper(),
+    known: harness.known,
+    live: new Map<string, LiveTask>(),
+  });
+
+  tracked.notifyCompletion(record);
+  assert.equal(harness.sent.length, 1);
+  const completion = harness.sent[0]!;
+  assert.equal(completion.message.customType, "pi-subagent-notification");
+  assert.match(String(completion.message.content), /<task-notification>/);
+  assert.equal(completion.message.display, true);
+  assert.equal(completion.message.details, record);
+  assert.deepEqual(completion.options, { triggerTurn: true, deliverAs: "followUp" });
+  // Deduper suppresses the duplicate completion callback for this invocation.
+  tracked.notifyCompletion(record);
+  assert.equal(harness.sent.length, 1);
+  // Quota slot released exactly once, and known/live bookkeeping updated.
+  assert.equal(harness.taskQuota.inUse, 0);
+  assert.equal(harness.known.get(record.id), record);
+  // Foreground completions return through the tool call; no root notification.
+  tracked.notifyCompletion({ ...partialTask(), id: "foreground-task", background: false, status: "completed" as const });
+  assert.equal(harness.sent.length, 1);
+
+  const warningRecord = { ...partialTask(), status: "running" as const };
+  tracked.notifyProgressWarning(warningRecord, WARNING_DETAILS);
+  assert.equal(harness.sent.length, 2);
+  const warning = harness.sent[1]!;
+  assert.equal(warning.message.customType, "pi-subagent-progress-warning");
+  assert.match(String(warning.message.content), /<progress-warning>/);
+  assert.equal(warning.message.display, true);
+  assert.deepEqual(warning.message.details, { ...warningRecord, progressWarning: WARNING_DETAILS });
+  assert.deepEqual(warning.options, { triggerTurn: true, deliverAs: "followUp" });
 });

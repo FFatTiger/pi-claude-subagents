@@ -14,7 +14,7 @@ import { agentAllowsNestedAgents, type ToolDescriptor } from "./capabilities.ts"
 import { loadAgentModelSettings, loadConfig, type PiSubagentsConfig } from "./config.ts";
 import { resolveWarningSchedule } from "./lifecycle.ts";
 import { buildAgentListing, buildAgentToolDescription, buildParentPolicy, classifyDispatch, resolveTaskIsolation } from "./prompts.ts";
-import { launchTask, resumeCompletedTask, createTaskQuota, type LaunchSpec, type ParentLaunchContext } from "./runtime.ts";
+import { launchTask, resumeCompletedTask, createTaskQuota, type LaunchSpec, type ParentLaunchContext, type ProgressWarningDetails, type TaskQuota } from "./runtime.ts";
 import {
   cleanupExpiredTasks,
   formatTaskTargetError,
@@ -164,6 +164,84 @@ export function createCompletionDeduper(): CompletionDeduper {
       return true;
     },
   };
+}
+
+const STALE_EXTENSION_CTX_PREFIX = "This extension ctx is stale after session replacement or reload.";
+
+/** Match exactly the stale-ctx contract Pi's extension runner throws from assertActive() after invalidate(). */
+export function isStaleExtensionContextError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith(STALE_EXTENSION_CTX_PREFIX);
+}
+
+/**
+ * Send a parent notification through an extension API that the runner may have
+ * invalidated after a session replacement or reload. Only that precise stale
+ * contract is swallowed: the task record is already persisted, so dropping the
+ * notification is the correct outcome. Every other error stays observable.
+ */
+export function sendParentNotification(
+  pi: Pick<ExtensionAPI, "sendMessage">,
+  ...args: Parameters<ExtensionAPI["sendMessage"]>
+): void {
+  try {
+    pi.sendMessage(...args);
+  } catch (error) {
+    if (!isStaleExtensionContextError(error)) throw error;
+  }
+}
+
+export interface BackgroundNotifierDeps {
+  /** Parent extension API; invalidated by the runner after session replacement or reload. */
+  pi: Pick<ExtensionAPI, "sendMessage">;
+  config: () => PiSubagentsConfig;
+  taskQuota: TaskQuota;
+  quotaTasks: Set<string>;
+  completionDeduper: CompletionDeduper;
+  known: Map<string, TaskRecord>;
+  live: Map<string, LiveTask>;
+}
+
+/**
+ * Parent-facing completion and progress-warning delivery. Both run on background
+ * paths (task promise finalization, child turn_end) that no runner handler
+ * guards, so their sends go through sendParentNotification.
+ */
+export function createBackgroundNotifiers(deps: BackgroundNotifierDeps): {
+  notifyCompletion: (record: TaskRecord) => void;
+  notifyProgressWarning: (record: TaskRecord, details: ProgressWarningDetails) => void;
+} {
+  const { pi } = deps;
+  const notifyCompletion = (record: TaskRecord) => {
+    if (!deps.completionDeduper.shouldHandle(record.id)) return;
+    if (deps.quotaTasks.delete(record.id)) deps.taskQuota.release();
+    deps.known.set(record.id, record);
+    deps.live.delete(record.id);
+    // Nested completions stay with the direct parent; root-only delivery for background tasks.
+    if (record.parentTaskId || !record.background) return;
+    const config = deps.config();
+    const result = formatTaskOutputForModel(record, {
+      bytes: config.maxOutputBytes,
+      lines: config.maxOutputLines,
+    });
+    sendParentNotification(pi, {
+      customType: "pi-subagent-notification",
+      content: taskNotification(record, result),
+      display: true,
+      details: record,
+    }, { triggerTurn: true, deliverAs: "followUp" });
+  };
+
+  const notifyProgressWarning = (record: TaskRecord, details: ProgressWarningDetails) => {
+    deps.known.set(record.id, record);
+    sendParentNotification(pi, {
+      customType: "pi-subagent-progress-warning",
+      content: progressWarningNotification(record, details),
+      display: true,
+      details: { ...record, progressWarning: details },
+    }, { triggerTurn: true, deliverAs: "followUp" });
+  };
+
+  return { notifyCompletion, notifyProgressWarning };
 }
 
 export function formatTaskDiagnostic(record: TaskRecord): string {
@@ -343,6 +421,15 @@ export default function register(pi: ExtensionAPI): void {
   const taskQuota = createTaskQuota(currentConfig.maxConcurrentTasks);
   const quotaTasks = new Set<string>();
   const completionDeduper = createCompletionDeduper();
+  const { notifyCompletion, notifyProgressWarning } = createBackgroundNotifiers({
+    pi,
+    config: () => currentConfig,
+    taskQuota,
+    quotaTasks,
+    completionDeduper,
+    known,
+    live,
+  });
 
   const reload = (ctx: ExtensionContext) => {
     const includeProject = ctx.isProjectTrusted();
@@ -371,25 +458,6 @@ export default function register(pi: ExtensionAPI): void {
     }
   };
 
-  const notifyCompletion = (record: TaskRecord) => {
-    if (!completionDeduper.shouldHandle(record.id)) return;
-    if (quotaTasks.delete(record.id)) taskQuota.release();
-    known.set(record.id, record);
-    live.delete(record.id);
-    // Nested completions stay with the direct parent; root-only delivery for background tasks.
-    if (record.parentTaskId || !record.background) return;
-    const result = formatTaskOutputForModel(record, {
-      bytes: currentConfig.maxOutputBytes,
-      lines: currentConfig.maxOutputLines,
-    });
-    pi.sendMessage({
-      customType: "pi-subagent-notification",
-      content: taskNotification(record, result),
-      display: true,
-      details: record,
-    }, { triggerTurn: true, deliverAs: "followUp" });
-  };
-
   const finalizeForegroundTask = (record: TaskRecord) => {
     if (!completionDeduper.shouldHandle(record.id)) return;
     if (quotaTasks.delete(record.id)) taskQuota.release();
@@ -402,22 +470,6 @@ export default function register(pi: ExtensionAPI): void {
     // promotes it to background, final completion must be delivered to the root parent.
     if (record.background) notifyCompletion(record);
     else finalizeForegroundTask(record);
-  };
-
-  const notifyProgressWarning = (record: TaskRecord, details: {
-    turn: number;
-    nextWarningTurn: number;
-    warningCount: number;
-    warningTurns: number;
-    warningIntervalTurns: number;
-  }) => {
-    known.set(record.id, record);
-    pi.sendMessage({
-      customType: "pi-subagent-progress-warning",
-      content: progressWarningNotification(record, details),
-      display: true,
-      details: { ...record, progressWarning: details },
-    }, { triggerTurn: true, deliverAs: "followUp" });
   };
 
   pi.on("session_start", (_event, ctx) => {

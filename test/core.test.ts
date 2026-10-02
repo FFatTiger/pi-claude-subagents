@@ -564,13 +564,46 @@ test("fork preparation rejects non-durable parent branch", async () => {
   const sessionDir = path.join(cwd, "sessions");
   const { SessionManager } = await import("@earendil-works/pi-coding-agent");
   const manager = SessionManager.create(cwd, sessionDir);
-  const leaf = manager.appendMessage({ role: "user", content: "not durable yet", timestamp: Date.now() });
+  // Setup-only entries (thinking level changes) never form a conversation, so the
+  // branch stays in memory and Pi never creates the session file on disk — even
+  // on Pi >= 1.0, where the first user message is persisted eagerly.
+  const leaf = manager.appendThinkingLevelChange("high");
   const headerPath = manager.getSessionFile();
   assert.ok(headerPath);
+  // Explicitly verify the parent branch is genuinely not durable.
+  assert.equal(fs.existsSync(headerPath!), false);
+  assert.ok(manager.getBranch().some(entry => entry.id === leaf));
   await assert.rejects(
     prepareForkSession({ parentSessionFile: headerPath!, parentLeafId: leaf, cwd }),
     /not been durably written/,
   );
+});
+
+test("fork succeeds from the first persisted user turn (Pi 1.0 eager persistence)", async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fork-user-leaf-"));
+  const sessionDir = path.join(cwd, "sessions");
+  const { SessionManager } = await import("@earendil-works/pi-coding-agent");
+  const parent = SessionManager.create(cwd, sessionDir);
+  // Pi >= 1.0 flushes the session file as soon as the first user message exists.
+  const leaf = parent.appendMessage({ role: "user", content: "fork source turn", timestamp: Date.now() });
+  const parentSessionFile = parent.getSessionFile();
+  assert.ok(parentSessionFile);
+  assert.ok(fs.existsSync(parentSessionFile!));
+  assert.ok(fs.readFileSync(parentSessionFile!, "utf8").includes(leaf));
+
+  const forked = await prepareForkSession({ parentSessionFile: parentSessionFile!, parentLeafId: leaf, cwd });
+  const forkedSessionFile = forked.getSessionFile();
+  assert.ok(forkedSessionFile);
+  assert.equal(path.dirname(forkedSessionFile!), sessionDir);
+  assert.ok(fs.existsSync(forkedSessionFile!));
+  // Catalogue linkage: the fork stays in the standard session catalogue and points at its parent.
+  const header = JSON.parse(fs.readFileSync(forkedSessionFile!, "utf8").split("\n")[0]!);
+  assert.equal(header.type, "session");
+  assert.equal(header.parentSession, parentSessionFile);
+  const listed = await SessionManager.listAll(sessionDir);
+  assert.ok(listed.some(entry => entry.path === forkedSessionFile));
+  // The fork inherits the persisted user turn it branched from.
+  assert.ok(forked.getBranch().some(entry => entry.id === leaf));
 });
 
 test("resume fallback does not reuse historical output", () => {

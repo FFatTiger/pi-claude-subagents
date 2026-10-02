@@ -72,6 +72,8 @@ A resumable role reopens its persisted `session.jsonl`, reuses recorded budgets 
 
 Interactive and RPC launches default to background. Print and JSON launches complete synchronously. Completion is represented as a task notification with status, summary, output file, result, error, usage, and retained-worktree metadata when applicable. Background completion is automatic; normal orchestration does not poll `TaskOutput`.
 
+Background completion and progress-warning sends run on paths no runner handler guards (task-promise finalization and child `turn_end`). They go through a shared send helper that swallows exactly Pi's stale-extension-ctx contract (`This extension ctx is stale after session replacement or reload.`): after a parent session replacement or reload the task record is already persisted, so the notification is dropped rather than thrown into an unguarded background promise. Every other send error stays observable; there is no global `unhandledRejection` handling and no reuse of the old ctx to write the new session.
+
 ## Prompt architecture
 
 The parent and child contracts are source-backed behavioral reconstructions adapted to Pi. They preserve architecture-relevant native constraints, including non-duplication, `Never delegate understanding`, no polling or fabricated background results, strict prompt-level read-only role instructions, adversarial verification, and direct Fork execution. Claude-specific identity, paths, configuration, memory, hooks, permissions, and MCP syntax are excluded.
