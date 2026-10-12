@@ -268,11 +268,13 @@ test("auto resume reports quota abort as a structured failure", async () => {
   });
 });
 
-test("reload orphans only running records that are not live", () => {
+test("reload orphans only running records that are neither live nor resuming", () => {
   const live = new Set(["live-task"]);
-  assert.equal(shouldOrphanRestoredTask({ id: "live-task", status: "running" }, live), false);
-  assert.equal(shouldOrphanRestoredTask({ id: "dead-task", status: "running" }, live), true);
-  assert.equal(shouldOrphanRestoredTask({ id: "stopped-task", status: "stopped" }, live), false);
+  const resuming = new Set(["resuming-task"]);
+  assert.equal(shouldOrphanRestoredTask({ id: "live-task", status: "running" }, live, resuming), false);
+  assert.equal(shouldOrphanRestoredTask({ id: "resuming-task", status: "running" }, live, resuming), false);
+  assert.equal(shouldOrphanRestoredTask({ id: "dead-task", status: "running" }, live, resuming), true);
+  assert.equal(shouldOrphanRestoredTask({ id: "stopped-task", status: "stopped" }, live, resuming), false);
 });
 
 test("parent shutdown persist writes stopped/parent_shutdown before awaiting stop", async () => {
@@ -308,6 +310,6 @@ test("parent shutdown persist writes stopped/parent_shutdown before awaiting sto
   assert.equal(persisted[0]!.terminationKind, "parent_shutdown");
   assert.equal(shouldOrphanRestoredTask(persisted[0]!, new Set()), false);
   assert.equal(shouldOrphanRestoredTask(recordState, liveIds), false);
-  resolveStop();
   await persistPromise;
+  resolveStop();
 });
