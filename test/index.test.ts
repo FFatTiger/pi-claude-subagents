@@ -691,8 +691,31 @@ test("register wires notification lifecycle to agent events and a batch renderer
     assert.ok(reg.handlers.has(event), `missing handler for ${event}`);
   }
   assert.ok(reg.renderers.has("pi-subagent-notification-batch"));
+  assert.ok(reg.renderers.has("pi-subagent-interrupted-tasks"), "interruption notice renderer");
   // Tool guidance no longer mandates a TaskOutput inspection per warning.
   const taskOutput = reg.tools.get("TaskOutput");
   assert.ok(taskOutput);
   assert.equal(/legitimizes one TaskOutput inspection/.test(String(taskOutput.description)), false);
+});
+
+test("session_start fires at most one interruption notice and honors off mode", () => {
+  const reg = registrationPi();
+  register(reg.pi);
+  const sessionStart = reg.handlers.get("session_start") as (event: unknown, ctx: unknown) => unknown;
+  assert.ok(sessionStart, "session_start handler registered");
+  const ctx = {
+    cwd: process.cwd(),
+    isProjectTrusted: () => false,
+    hasUI: false,
+    sessionManager: {
+      getSessionId: () => `interruption-notice-test-${process.pid}`,
+      getSessionFile: () => undefined,
+      getLeafId: () => undefined,
+    },
+  };
+  sessionStart({ type: "session_start", reason: "startup" }, ctx);
+  sessionStart({ type: "session_start", reason: "reload" }, ctx);
+  // No recoverable tasks exist for this synthetic session id: nothing is sent,
+  // and the once-per-process guard keeps it that way even if one appeared later.
+  assert.equal(reg.sent.filter(call => call.message.customType === "pi-subagent-interrupted-tasks").length, 0);
 });

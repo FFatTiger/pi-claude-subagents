@@ -305,11 +305,14 @@ Trusted project:
   "proactivePrompt": true,
   "verificationPrompt": true,
   "verificationFileThreshold": 3,
-  "cleanupPeriodDays": null
+  "cleanupPeriodDays": null,
+  "interruptedTaskResume": "notify"
 }
 ```
 
 The public `Agent` schema requires `warning_turns` and `warning_interval_turns` on every root call. The runtime fallback and general recommendation are `40 / 25`. The caller should override that pair only when task scope, uncertainty, drift/stall risk, tool cost, or external waiting materially warrants one of the documented ranges. Tasks-array entries inherit top-level values unless their risk materially differs. Warnings are supervision checkpoints rather than timeout signals, and children emit more frequent concise stage notes independently of the warning schedule. Defaults leave hard timeout, turn, tool, and cleanup budgets unset. Positive `cleanupPeriodDays` enables age-based retention cleanup. Legacy `maxOutputChars` still maps to `maxOutputBytes`. Bundled roles declare no hard budgets; custom frontmatter and runtime config can still define advanced unattended policies.
+
+`interruptedTaskResume` controls what happens on the next `session_start` when background tasks were stopped by a previous parent shutdown (`stopped/parent_shutdown` — the parent Pi process quit, reloaded, or switched sessions while they were still running). Their child sessions stay persisted, so the work is recoverable with `SendMessage`. `"notify"` (default) sends one notice listing the recoverable tasks with their IDs and progress; `"off"` disables the notice. One-shot tasks (e.g. `Explore`) and tasks whose isolated worktree was cleaned are never resumable and are not listed.
 
 ## Persistence
 

@@ -12,6 +12,7 @@ import { Type } from "typebox";
 import { applyAgentModelSettings, discoverAgents, findAgent, resolvePackageRoot, type AgentDefinition } from "./agents.ts";
 import { agentAllowsNestedAgents, type ToolDescriptor } from "./capabilities.ts";
 import { loadAgentModelSettings, loadConfig, type PiSubagentsConfig } from "./config.ts";
+import { selectInterruptedTasks, formatInterruptedTasksNotice, isResumableInterruptedTask } from "./interrupted.ts";
 import { resolveWarningSchedule } from "./lifecycle.ts";
 import { buildAgentListing, buildAgentToolDescription, buildParentPolicy, classifyDispatch, resolveTaskIsolation } from "./prompts.ts";
 import { launchTask, resumeCompletedTask, createTaskQuota, type LaunchSpec, type ParentLaunchContext, type ProgressWarningDetails, type TaskQuota } from "./runtime.ts";
@@ -592,6 +593,55 @@ export default function register(pi: ExtensionAPI): void {
   });
   const { notifyCompletion, notifyProgressWarning } = notifiers;
 
+  // One interruption-recovery notice per process: `session_start` fires on
+  // startup, reload, new, resume, and fork, and reload() may run several times
+  // per process (before_agent_start reloads config too). Tasks stopped by a
+  // previous parent shutdown are resumable; the notice teaches the parent to
+  // continue them with SendMessage instead of silently losing the work.
+  let interruptedNoticeSent = false;
+
+  const resumeInterruptedTask = async (ctx: ExtensionContext, record: TaskRecord): Promise<string> => {
+    const agent = findAgent(currentAgents, record.agent);
+    if (!agent) return `Agent definition no longer exists: ${record.agent}`;
+    await taskQuota.acquire(1);
+    try {
+      let invocation: number | undefined;
+      const resumeRecord = structuredClone(record);
+      const resumed = await resumeCompletedTask({
+        record: resumeRecord,
+        onPrepared: () => {
+          invocation = notifiers.beginInvocation(record.id);
+          known.set(record.id, resumeRecord);
+          quotaTasks.add(record.id);
+        },
+        message: "Your session was interrupted by a parent shutdown. Resume exactly where you left off: restate nothing you already established, reuse your earlier findings, and deliver your final report.",
+        agent,
+        agents: currentAgents,
+        parent: {
+          ...currentParent(pi, ctx),
+          parentSessionId: record.rootParentSessionId ?? record.parentSessionId,
+          rootParentSessionId: record.rootParentSessionId ?? record.parentSessionId,
+          parentTaskId: record.parentTaskId,
+          depth: Math.max(0, (record.depth ?? 1) - 1),
+          taskQuota,
+        },
+        config: currentConfig,
+        onTaskStarted: nested => {
+          known.set(nested.record.id, nested.record);
+          live.set(nested.record.id, nested);
+          quotaTasks.add(nested.record.id);
+        },
+        onComplete: r => notifyCompletion(r, r.id === record.id ? invocation : undefined),
+        onProgressWarning: (r, details) => notifyProgressWarning(r, details, r.id === record.id ? invocation : undefined),
+      });
+      if (resumed.record.completedAt === undefined) live.set(record.id, resumed);
+      return `Resumed ${record.description} in background.`;
+    } catch (error) {
+      taskQuota.release();
+      return error instanceof Error ? error.message : String(error);
+    }
+  };
+
   const reload = (ctx: ExtensionContext) => {
     const includeProject = ctx.isProjectTrusted();
     const loadedConfig = loadConfig(ctx.cwd, includeProject);
@@ -636,6 +686,48 @@ export default function register(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => {
     reload(ctx);
     void cleanupExpiredTasks(currentConfig.cleanupPeriodDays);
+    if (interruptedNoticeSent) return;
+    interruptedNoticeSent = true;
+    const mode = currentConfig.interruptedTaskResume;
+    if (mode === "off") return;
+    const candidates = selectInterruptedTasks(loadTaskRecords(parentSessionId));
+    const resumable = candidates.filter(candidate => isResumableInterruptedTask(candidate.record));
+    if (resumable.length === 0) return;
+    if (mode === "auto") {
+      void (async () => {
+        const outcomes: string[] = [];
+        for (const candidate of resumable) {
+          try {
+            outcomes.push(await resumeInterruptedTask(ctx, candidate.record));
+          } catch (error) {
+            outcomes.push(`Resume failed for ${candidate.record.description}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        const failures = outcomes.filter(o => o.startsWith("Resume failed"));
+        if (failures.length > 0) {
+          const notice = formatInterruptedTasksNotice(candidates) ?? "Background tasks were interrupted by a previous parent shutdown.";
+          sendParentNotification(
+            pi,
+            { customType: "pi-subagent-interrupted-tasks", content: `${notice}\n\nSome auto-resumes failed; continue them with SendMessage:\n${failures.join("\n")}`, display: true, details: undefined },
+            { triggerTurn: true, deliverAs: "followUp" },
+          );
+          return;
+        }
+        sendParentNotification(
+          pi,
+          { customType: "pi-subagent-interrupted-tasks", content: formatInterruptedTasksNotice(candidates, { autoResumed: true }) ?? "", display: true, details: undefined },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+      })();
+      return;
+    }
+    const notice = formatInterruptedTasksNotice(candidates);
+    if (!notice) return;
+    sendParentNotification(
+      pi,
+      { customType: "pi-subagent-interrupted-tasks", content: notice, display: true, details: undefined },
+      { triggerTurn: true, deliverAs: "followUp" },
+    );
   });
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -702,6 +794,16 @@ export default function register(pi: ExtensionAPI): void {
       return `${icon} ${theme.bold(record.description)} ${theme.fg("dim", record.status)}`;
     });
     return new Text(lines.length ? lines.join("\n") : "Subagent notifications", 0, 0);
+  });
+
+  pi.registerMessageRenderer("pi-subagent-interrupted-tasks", (message, _options, theme) => {
+    const content = typeof message.content === "string" ? message.content : "Interrupted subagent tasks are recoverable";
+    const lines = content.split("\n").filter((line) => line.startsWith("- ")).map((line) => `${theme.fg("warning", "■")} ${line.slice(2)}`);
+    return new Text(
+      [`${theme.fg("warning", "↻")} ${theme.bold("Interrupted background tasks")} ${theme.fg("dim", "(parent shutdown; SendMessage to continue)")}`, ...lines].join("\n"),
+      0,
+      0,
+    );
   });
 
   pi.registerTool({

@@ -38,7 +38,7 @@ The Pi extension adapter exposes this seam as `Agent`, `SendMessage`, `TaskOutpu
 6. A configured turn count is a soft wrap-up threshold followed by a grace window (default 1). Continuation beyond `maxTurns + graceTurns` records `partial/turn_budget`.
 7. Background completion enters the root session through a Pi follow-up message with exact status and termination kind.
 8. `SendMessage` steers a live child or reopens a persisted child session with a fresh invocation boundary.
-9. `session_shutdown` records `parent_shutdown`, aborts root-owned live tasks, and releases in-memory handles through normal finalization.
+9. `session_shutdown` records `parent_shutdown`, aborts root-owned live tasks, and releases in-memory handles through normal finalization. Because child sessions are persisted, those tasks remain resumable: on the next `session_start` for the same parent session the extension surfaces them (`interruptedTaskResume`, default `notify`) so the parent can continue them with `SendMessage` instead of losing the work. One-shot tasks and cleaned worktrees are never listed.
 10. Parent Stop / tool `AbortSignal` stays attached for the entire blocking `Agent` wait (launch + foreground race). Progress-warning promotion flips the child to supervised background so later parent Stop does not cancel it; only still-blocking foreground children are stopped.
 
 ## Dispatch

@@ -44,6 +44,8 @@ export interface PiSubagentsConfig {
   verificationPrompt: boolean;
   verificationFileThreshold: number;
   cleanupPeriodDays?: number;
+  /** How to handle tasks interrupted by a previous parent shutdown on the next session_start. Default "notify". */
+  interruptedTaskResume?: "notify" | "auto" | "off";
 }
 
 export const DEFAULT_WARNING_TURNS = 40;
@@ -71,6 +73,7 @@ export const DEFAULT_CONFIG: PiSubagentsConfig = {
   verificationPrompt: true,
   verificationFileThreshold: 3,
   cleanupPeriodDays: undefined,
+  interruptedTaskResume: "notify",
 };
 
 function readJson(filePath: string): Record<string, unknown> {
@@ -234,6 +237,9 @@ export function applyConfig(base: PiSubagentsConfig, raw: Record<string, unknown
     verificationPrompt: booleanValue(raw.verificationPrompt, base.verificationPrompt),
     verificationFileThreshold: numberValue(raw.verificationFileThreshold, base.verificationFileThreshold, 1),
     cleanupPeriodDays: optionalNumberValue(raw.cleanupPeriodDays, base.cleanupPeriodDays, 1),
+    interruptedTaskResume: raw.interruptedTaskResume === "auto" || raw.interruptedTaskResume === "off" || raw.interruptedTaskResume === "notify"
+      ? raw.interruptedTaskResume
+      : base.interruptedTaskResume,
   };
 }
 
