@@ -18,7 +18,7 @@ import register, {
 } from "../src/index.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { createTaskQuota, type ProgressWarningDetails } from "../src/runtime.ts";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendTaskOutput, formatTaskOutputForModel, saveTaskOutput, type LiveTask, type TaskRecord } from "../src/tasks.ts";
 
 function partialTask(): TaskRecord {
@@ -698,24 +698,173 @@ test("register wires notification lifecycle to agent events and a batch renderer
   assert.equal(/legitimizes one TaskOutput inspection/.test(String(taskOutput.description)), false);
 });
 
-test("session_start fires at most one interruption notice and honors off mode", () => {
-  const reg = registrationPi();
-  register(reg.pi);
-  const sessionStart = reg.handlers.get("session_start") as (event: unknown, ctx: unknown) => unknown;
-  assert.ok(sessionStart, "session_start handler registered");
-  const ctx = {
-    cwd: process.cwd(),
-    isProjectTrusted: () => false,
+function identityTheme() {
+  return {
+    fg: (_color: string, value: string) => value,
+    bold: (value: string) => value,
+  };
+}
+
+function interruptedNotices(sent: SentCall[]) {
+  return sent.filter(call => call.message.customType === "pi-subagent-interrupted-tasks");
+}
+
+async function waitForInterruptedNotice(sent: SentCall[], count = 1) {
+  for (let i = 0; i < 50; i++) {
+    if (interruptedNotices(sent).length >= count) return interruptedNotices(sent);
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+  return interruptedNotices(sent);
+}
+
+function seedInterruptedTask(sessionId: string, overrides: Partial<TaskRecord> = {}) {
+  const id = overrides.id ?? "11111111-2222-3333-4444-555555555555";
+  const dir = path.join(getAgentDir(), "pi-claude-subagents", sessionId, id);
+  fs.mkdirSync(dir, { recursive: true });
+  const sessionFile = path.join(dir, "session.jsonl");
+  fs.writeFileSync(sessionFile, "session\n");
+  const task: TaskRecord = {
+    ...partialTask(),
+    id,
+    parentSessionId: sessionId,
+    agent: "verification",
+    description: "Verify release baseline fixes",
+    status: "stopped",
+    terminationKind: "parent_shutdown",
+    completedAt: new Date().toISOString(),
+    sessionFile,
+    taskFile: path.join(dir, "task.json"),
+    outputFile: path.join(dir, "output.md"),
+    ...overrides,
+  };
+  fs.writeFileSync(task.taskFile, `${JSON.stringify(task, null, 2)}\n`);
+  return task;
+}
+
+function sessionCtx(sessionId: string, cwd = process.cwd(), trusted = false) {
+  return {
+    cwd,
+    isProjectTrusted: () => trusted,
     hasUI: false,
     sessionManager: {
-      getSessionId: () => `interruption-notice-test-${process.pid}`,
+      getSessionId: () => sessionId,
       getSessionFile: () => undefined,
       getLeafId: () => undefined,
     },
   };
-  sessionStart({ type: "session_start", reason: "startup" }, ctx);
-  sessionStart({ type: "session_start", reason: "reload" }, ctx);
-  // No recoverable tasks exist for this synthetic session id: nothing is sent,
-  // and the once-per-process guard keeps it that way even if one appeared later.
-  assert.equal(reg.sent.filter(call => call.message.customType === "pi-subagent-interrupted-tasks").length, 0);
+}
+
+function withProjectMode(mode: "notify" | "auto" | "off") {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-interrupted-cwd-"));
+  const dir = path.join(cwd, ".pi");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "pi-claude-subagents.json"), JSON.stringify({ interruptedTaskResume: mode }));
+  return cwd;
+}
+
+test("empty session_start does not consume eligibility; a later candidate is delivered", () => {
+  const sessionId = `empty-then-candidate-${process.pid}-${Date.now()}`;
+  const taskRoot = path.join(getAgentDir(), "pi-claude-subagents", sessionId);
+  try {
+    const reg = registrationPi();
+    register(reg.pi);
+    const sessionStart = reg.handlers.get("session_start") as (event: unknown, ctx: unknown) => unknown;
+    sessionStart({ type: "session_start", reason: "startup" }, sessionCtx(sessionId));
+    assert.equal(interruptedNotices(reg.sent).length, 0);
+    seedInterruptedTask(sessionId);
+    sessionStart({ type: "session_start", reason: "reload" }, sessionCtx(sessionId));
+    const notices = interruptedNotices(reg.sent);
+    assert.equal(notices.length, 1);
+    assert.match(String(notices[0]!.message.content), /SendMessage/);
+    assert.deepEqual(notices[0]!.message.details, { autoResumed: false });
+    sessionStart({ type: "session_start", reason: "reload" }, sessionCtx(sessionId));
+    assert.equal(interruptedNotices(reg.sent).length, 1, "same parent session is notified at most once");
+  } finally {
+    fs.rmSync(taskRoot, { recursive: true, force: true });
+  }
+});
+
+test("off mode suppresses delivery without consuming a later notify session", () => {
+  const sessionId = `off-then-notify-${process.pid}-${Date.now()}`;
+  const taskRoot = path.join(getAgentDir(), "pi-claude-subagents", sessionId);
+  const offCwd = withProjectMode("off");
+  const notifyCwd = withProjectMode("notify");
+  try {
+    const reg = registrationPi();
+    register(reg.pi);
+    const sessionStart = reg.handlers.get("session_start") as (event: unknown, ctx: unknown) => unknown;
+    seedInterruptedTask(sessionId);
+    sessionStart({ type: "session_start", reason: "startup" }, sessionCtx(sessionId, offCwd, true));
+    assert.equal(interruptedNotices(reg.sent).length, 0);
+    sessionStart({ type: "session_start", reason: "reload" }, sessionCtx(sessionId, notifyCwd, true));
+    assert.equal(interruptedNotices(reg.sent).length, 1);
+  } finally {
+    fs.rmSync(taskRoot, { recursive: true, force: true });
+    fs.rmSync(offCwd, { recursive: true, force: true });
+    fs.rmSync(notifyCwd, { recursive: true, force: true });
+  }
+});
+
+test("unrelated parent sessions are not suppressed by an earlier notice", () => {
+  const first = `notice-parent-a-${process.pid}-${Date.now()}`;
+  const second = `notice-parent-b-${process.pid}-${Date.now()}`;
+  try {
+    const reg = registrationPi();
+    register(reg.pi);
+    const sessionStart = reg.handlers.get("session_start") as (event: unknown, ctx: unknown) => unknown;
+    seedInterruptedTask(first, { id: "aaaaaaaa-1111-4111-8111-111111111111" });
+    seedInterruptedTask(second, { id: "bbbbbbbb-2222-4222-8222-222222222222" });
+    sessionStart({ type: "session_start", reason: "startup" }, sessionCtx(first));
+    sessionStart({ type: "session_start", reason: "startup" }, sessionCtx(second));
+    assert.equal(interruptedNotices(reg.sent).length, 2);
+  } finally {
+    fs.rmSync(path.join(getAgentDir(), "pi-claude-subagents", first), { recursive: true, force: true });
+    fs.rmSync(path.join(getAgentDir(), "pi-claude-subagents", second), { recursive: true, force: true });
+  }
+});
+
+test("auto mode reports missing-agent failure instead of success", async () => {
+  const sessionId = `auto-missing-agent-${process.pid}-${Date.now()}`;
+  const taskRoot = path.join(getAgentDir(), "pi-claude-subagents", sessionId);
+  const cwd = withProjectMode("auto");
+  try {
+    const reg = registrationPi();
+    register(reg.pi);
+    const sessionStart = reg.handlers.get("session_start") as (event: unknown, ctx: unknown) => unknown;
+    seedInterruptedTask(sessionId, { agent: "missing-role" });
+    sessionStart({ type: "session_start", reason: "startup" }, sessionCtx(sessionId, cwd, true));
+    const notices = await waitForInterruptedNotice(reg.sent);
+    assert.equal(notices.length, 1);
+    const content = String(notices[0]!.message.content);
+    assert.match(content, /Agent definition no longer exists: missing-role/);
+    assert.match(content, /SendMessage/);
+    assert.equal(content.includes("resumed automatically"), false);
+    assert.equal((notices[0]!.message.details as { autoResumed?: boolean }).autoResumed, false);
+  } finally {
+    fs.rmSync(taskRoot, { recursive: true, force: true });
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("interrupted-tasks renderer stays honest for auto vs notify", () => {
+  const reg = registrationPi();
+  register(reg.pi);
+  const renderer = reg.renderers.get("pi-subagent-interrupted-tasks") as (
+    message: { content: string; details?: { autoResumed?: boolean } },
+    options: unknown,
+    theme: ReturnType<typeof identityTheme>,
+  ) => { render: (width: number) => string[] };
+  const notifyText = renderer(
+    { content: "<interrupted-tasks>\n- task\nSendMessage\n</interrupted-tasks>", details: { autoResumed: false } },
+    {},
+    identityTheme(),
+  ).render(120).join("\n");
+  assert.match(notifyText, /SendMessage/);
+  const autoText = renderer(
+    { content: "<interrupted-tasks>\n- task\nresumed automatically\n</interrupted-tasks>", details: { autoResumed: true } },
+    {},
+    identityTheme(),
+  ).render(120).join("\n");
+  assert.match(autoText, /resumed automatically/);
+  assert.equal(autoText.includes("SendMessage"), false);
 });

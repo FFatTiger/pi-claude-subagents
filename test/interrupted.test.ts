@@ -5,8 +5,11 @@ import {
   isInterruptedByParent,
   isResumableInterruptedTask,
   selectInterruptedTasks,
+  shouldOfferInterruptedRecovery,
 } from "../src/interrupted.ts";
-import type { TaskRecord } from "../src/tasks.ts";
+import { attemptAutoResume, persistLiveTasksForParentShutdown, quotaAcquireSignal, shouldOrphanRestoredTask } from "../src/index.ts";
+import type { LiveTask, TaskRecord } from "../src/tasks.ts";
+import type { AgentDefinition } from "../src/agents.ts";
 
 function record(overrides: Partial<TaskRecord> = {}): TaskRecord {
   return {
@@ -89,6 +92,7 @@ test("notice lists only recoverable tasks and teaches SendMessage recovery", () 
     { autoResumed: true },
   );
   assert.match(autoNotice!, /resumed automatically/);
+  assert.equal(autoNotice!.includes("SendMessage"), false);
 });
 
 test("notice returns null when nothing is recoverable", () => {
@@ -106,6 +110,38 @@ test("notice returns null when nothing is recoverable", () => {
   );
 });
 
+test("notice escapes XML-sensitive task fields", () => {
+  const notice = formatInterruptedTasksNotice(
+    selectInterruptedTasks([
+      record({
+        id: "id<1>",
+        description: "Fix <root> & friends",
+        agent: "verify&plan",
+      }),
+    ], () => true),
+  );
+  assert.ok(notice);
+  assert.match(notice, /Fix &lt;root&gt; &amp; friends/);
+  assert.match(notice, /verify&amp;plan/);
+  assert.match(notice, /task_id: id&lt;1&gt;/);
+  assert.equal(notice.includes("<root>"), false);
+});
+
+test("auto failure notice keeps SendMessage guidance and escaped errors", () => {
+  const recoverable = record({ description: "Fix <root>", agent: "verify" });
+  const notice = formatInterruptedTasksNotice(
+    selectInterruptedTasks([recoverable], () => true),
+    {
+      autoResumed: false,
+      failures: [{ ok: false, record: recoverable, error: "Agent definition no longer exists: verify <gone>" }],
+    },
+  );
+  assert.ok(notice);
+  assert.match(notice, /Some auto-resumes failed; continue them with SendMessage/);
+  assert.match(notice, /Agent definition no longer exists: verify &lt;gone&gt;/);
+  assert.equal(notice.includes("resumed automatically"), false);
+});
+
 test("config accepts interruptedTaskResume modes", async () => {
   const { applyConfig, DEFAULT_CONFIG } = await import("../src/config.ts");
   assert.equal(applyConfig(DEFAULT_CONFIG, { interruptedTaskResume: "off" }).interruptedTaskResume, "off");
@@ -113,4 +149,165 @@ test("config accepts interruptedTaskResume modes", async () => {
   assert.equal(applyConfig(DEFAULT_CONFIG, { interruptedTaskResume: "notify" }).interruptedTaskResume, "notify");
   assert.equal(applyConfig(DEFAULT_CONFIG, { interruptedTaskResume: "bogus" as unknown }).interruptedTaskResume, "notify");
   assert.equal(DEFAULT_CONFIG.interruptedTaskResume, "notify");
+});
+
+test("recovery eligibility is per parent session and ignores off or empty candidate lists", () => {
+  const notified = new Set<string>();
+  assert.equal(shouldOfferInterruptedRecovery({
+    sessionId: "parent-a",
+    notifiedSessionIds: notified,
+    mode: "off",
+    resumableCount: 1,
+  }), false);
+  assert.equal(shouldOfferInterruptedRecovery({
+    sessionId: "parent-a",
+    notifiedSessionIds: notified,
+    mode: "notify",
+    resumableCount: 0,
+  }), false);
+  assert.equal(shouldOfferInterruptedRecovery({
+    sessionId: "parent-a",
+    notifiedSessionIds: notified,
+    mode: "notify",
+    resumableCount: 1,
+  }), true);
+  notified.add("parent-a");
+  assert.equal(shouldOfferInterruptedRecovery({
+    sessionId: "parent-a",
+    notifiedSessionIds: notified,
+    mode: "notify",
+    resumableCount: 1,
+  }), false);
+  assert.equal(shouldOfferInterruptedRecovery({
+    sessionId: "parent-b",
+    notifiedSessionIds: notified,
+    mode: "auto",
+    resumableCount: 2,
+  }), true);
+});
+
+test("auto resume reports missing agent and resume throws as structured failures", async () => {
+  const task = record();
+  const missing = await attemptAutoResume({
+    record: task,
+    agent: undefined,
+    acquire: async () => { throw new Error("should not acquire"); },
+    resume: async () => { throw new Error("should not resume"); },
+    release: () => { throw new Error("should not release"); },
+  });
+  assert.deepEqual(missing, {
+    ok: false,
+    record: task,
+    error: "Agent definition no longer exists: verification",
+  });
+
+  let released = 0;
+  const thrown = await attemptAutoResume({
+    record: task,
+    agent: { name: "verification" } as AgentDefinition,
+    acquire: async () => {},
+    resume: async () => { throw new Error("No persisted child session for task"); },
+    release: () => { released++; },
+  });
+  assert.equal(thrown.ok, false);
+  if (!thrown.ok) assert.match(thrown.error, /No persisted child session/);
+  assert.equal(released, 1);
+});
+
+test("auto resume success is an explicit ok result, not a string prefix", async () => {
+  const task = record({ status: "running", terminationKind: undefined });
+  const outcome = await attemptAutoResume({
+    record: task,
+    agent: { name: "verification" } as AgentDefinition,
+    acquire: async () => {},
+    resume: async () => ({ record: task }) as LiveTask,
+    release: () => { throw new Error("should not release on success"); },
+  });
+  assert.deepEqual(outcome, { ok: true, record: task });
+});
+
+test("auto resume failure from resumeCompletedTask is never classified by string prefix", async () => {
+  const task = record();
+  const outcome = await attemptAutoResume({
+    record: task,
+    agent: { name: "verification" } as AgentDefinition,
+    acquire: async () => {},
+    resume: async () => { throw new Error("Resume failed for Verify release baseline fixes: boom"); },
+    release: () => {},
+  });
+  assert.equal(outcome.ok, false);
+  const successNotice = formatInterruptedTasksNotice(
+    selectInterruptedTasks([task], () => true),
+    { autoResumed: true, failures: [outcome] },
+  );
+  assert.ok(successNotice);
+  assert.equal(successNotice.includes("resumed automatically"), false);
+  assert.match(successNotice, /SendMessage/);
+});
+
+test("quota acquire uses the parent signal when present and otherwise a timeout", () => {
+  const parent = AbortSignal.abort();
+  assert.equal(quotaAcquireSignal(parent), parent);
+  const bounded = quotaAcquireSignal(undefined, 5);
+  assert.equal(bounded.aborted, false);
+});
+
+test("auto resume reports quota abort as a structured failure", async () => {
+  const task = record();
+  const outcome = await attemptAutoResume({
+    record: task,
+    agent: { name: "verification" } as AgentDefinition,
+    acquire: async () => { throw new Error("Task quota acquisition aborted"); },
+    resume: async () => { throw new Error("should not resume"); },
+    release: () => { throw new Error("should not release"); },
+  });
+  assert.deepEqual(outcome, {
+    ok: false,
+    record: task,
+    error: "Task quota acquisition aborted",
+  });
+});
+
+test("reload orphans only running records that are not live", () => {
+  const live = new Set(["live-task"]);
+  assert.equal(shouldOrphanRestoredTask({ id: "live-task", status: "running" }, live), false);
+  assert.equal(shouldOrphanRestoredTask({ id: "dead-task", status: "running" }, live), true);
+  assert.equal(shouldOrphanRestoredTask({ id: "stopped-task", status: "stopped" }, live), false);
+});
+
+test("parent shutdown persist writes stopped/parent_shutdown before awaiting stop", async () => {
+  const persisted: TaskRecord[] = [];
+  let resolveStop!: () => void;
+  let stopStarted!: () => void;
+  const stopGate = new Promise<void>(resolve => { stopStarted = resolve; });
+  const recordState = record({
+    id: "live-task",
+    status: "running",
+    terminationKind: undefined,
+    completedAt: undefined,
+  });
+  const live: LiveTask = {
+    record: recordState,
+    abortController: new AbortController(),
+    promise: new Promise(() => {}),
+    send: async () => {},
+    stop: async () => {
+      stopStarted();
+      await new Promise<void>(resolve => { resolveStop = resolve; });
+    },
+  };
+  const liveIds = new Set([live.record.id]);
+
+  const persistPromise = persistLiveTasksForParentShutdown([live], async (saved) => {
+    persisted.push({ ...saved });
+  });
+  await stopGate;
+  for (let i = 0; i < 20 && persisted.length === 0; i++) await Promise.resolve();
+  assert.equal(persisted.length, 1, "owner persists before stop resolves");
+  assert.equal(persisted[0]!.status, "stopped");
+  assert.equal(persisted[0]!.terminationKind, "parent_shutdown");
+  assert.equal(shouldOrphanRestoredTask(persisted[0]!, new Set()), false);
+  assert.equal(shouldOrphanRestoredTask(recordState, liveIds), false);
+  resolveStop();
+  await persistPromise;
 });
