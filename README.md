@@ -16,10 +16,10 @@ Pick one install path:
 
 ```bash
 # npm
-pi install npm:pi-claude-subagents@0.3.8
+pi install npm:pi-claude-subagents@0.3.9
 
 # GitHub release
-pi install git:github.com/FFatTiger/pi-claude-subagents@v0.3.8
+pi install git:github.com/FFatTiger/pi-claude-subagents@v0.3.9
 
 # local checkout
 pi install /absolute/path/to/pi-claude-subagents
@@ -305,11 +305,20 @@ Trusted project:
   "proactivePrompt": true,
   "verificationPrompt": true,
   "verificationFileThreshold": 3,
-  "cleanupPeriodDays": null
+  "cleanupPeriodDays": null,
+  "interruptedTaskResume": "notify"
 }
 ```
 
 The public `Agent` schema requires `warning_turns` and `warning_interval_turns` on every root call. The runtime fallback and general recommendation are `40 / 25`. The caller should override that pair only when task scope, uncertainty, drift/stall risk, tool cost, or external waiting materially warrants one of the documented ranges. Tasks-array entries inherit top-level values unless their risk materially differs. Warnings are supervision checkpoints rather than timeout signals, and children emit more frequent concise stage notes independently of the warning schedule. Defaults leave hard timeout, turn, tool, and cleanup budgets unset. Positive `cleanupPeriodDays` enables age-based retention cleanup. Legacy `maxOutputChars` still maps to `maxOutputBytes`. Bundled roles declare no hard budgets; custom frontmatter and runtime config can still define advanced unattended policies.
+
+`interruptedTaskResume` controls what happens on the next `session_start` when background tasks were stopped by a previous parent shutdown (`stopped/parent_shutdown` — the parent Pi process quit, reloaded, or switched sessions while they were still running). Their child sessions stay persisted, so the work is recoverable. The notice is offered at most once per parent session in a process; `off` and empty candidate lists do not consume that eligibility, so a later start of the same or another session can still notify.
+
+- `"notify"` (default): one `<interrupted-tasks>` notice listing recoverable tasks (description, agent, turns so far, `task_id`) with `SendMessage` guidance.
+- `"auto"`: resume them through the existing resume path and report structured success or failure in the same notice. Failures (missing agent, resume throw, quota abort) stay failures; the UI does not claim they were auto-resumed.
+- `"off"`: disable recovery.
+
+One-shot tasks (e.g. `Explore`) and tasks whose isolated worktree was cleaned are never resumable and are not listed. Parent shutdown persists `stopped/parent_shutdown` before a later reload can classify the same records as orphans.
 
 ## Persistence
 

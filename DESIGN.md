@@ -19,7 +19,8 @@ The Pi extension adapter exposes this seam as `Agent`, `SendMessage`, `TaskOutpu
 
 ## Modules
 
-- `src/index.ts` — Pi extension registration, root-session state, tool/command adapters, notifications
+- `src/index.ts` — Pi extension registration, root-session state, tool/command adapters, notifications, interruption recovery
+- `src/interrupted.ts` — parent-shutdown candidate selection and notice formatting
 - `src/prompts.ts` — dispatch classification and parent/child prompt contracts
 - `src/agents.ts` — Pi-native role discovery and parsing
 - `src/capabilities.ts` — child tool selection
@@ -38,7 +39,7 @@ The Pi extension adapter exposes this seam as `Agent`, `SendMessage`, `TaskOutpu
 6. A configured turn count is a soft wrap-up threshold followed by a grace window (default 1). Continuation beyond `maxTurns + graceTurns` records `partial/turn_budget`.
 7. Background completion enters the root session through a Pi follow-up message with exact status and termination kind.
 8. `SendMessage` steers a live child or reopens a persisted child session with a fresh invocation boundary.
-9. `session_shutdown` records `parent_shutdown`, aborts root-owned live tasks, and releases in-memory handles through normal finalization.
+9. `session_shutdown` records `parent_shutdown`, aborts root-owned live tasks, persists those stopped records, then releases in-memory handles. Pi awaits this handler, so a later reload cannot classify the same tasks as orphans. Because child sessions are persisted, those tasks remain resumable: on the next `session_start` for the same parent session the extension surfaces them once per parent session (`interruptedTaskResume`). `notify` (default) lists recoverable tasks for `SendMessage`; `auto` resumes them through the existing resume path and reports structured success/failure; `off` disables recovery. Empty candidate lists and `off` do not consume eligibility. One-shot tasks and cleaned worktrees are never listed.
 10. Parent Stop / tool `AbortSignal` stays attached for the entire blocking `Agent` wait (launch + foreground race). Progress-warning promotion flips the child to supervised background so later parent Stop does not cancel it; only still-blocking foreground children are stopped.
 
 ## Dispatch

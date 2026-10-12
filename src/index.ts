@@ -12,6 +12,13 @@ import { Type } from "typebox";
 import { applyAgentModelSettings, discoverAgents, findAgent, resolvePackageRoot, type AgentDefinition } from "./agents.ts";
 import { agentAllowsNestedAgents, type ToolDescriptor } from "./capabilities.ts";
 import { loadAgentModelSettings, loadConfig, type PiSubagentsConfig } from "./config.ts";
+import {
+  formatInterruptedTasksNotice,
+  isResumableInterruptedTask,
+  selectInterruptedTasks,
+  shouldOfferInterruptedRecovery,
+  type AutoResumeOutcome,
+} from "./interrupted.ts";
 import { resolveWarningSchedule } from "./lifecycle.ts";
 import { buildAgentListing, buildAgentToolDescription, buildParentPolicy, classifyDispatch, resolveTaskIsolation } from "./prompts.ts";
 import { launchTask, resumeCompletedTask, createTaskQuota, type LaunchSpec, type ParentLaunchContext, type ProgressWarningDetails, type TaskQuota } from "./runtime.ts";
@@ -147,6 +154,65 @@ function xmlText(value: string): string {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
+}
+
+/** Match TaskOutput's default wait: prefer the live parent signal, otherwise bound the wait. */
+export const QUOTA_ACQUIRE_TIMEOUT_MS = 300_000;
+
+export function quotaAcquireSignal(signal?: AbortSignal, timeoutMs = QUOTA_ACQUIRE_TIMEOUT_MS): AbortSignal {
+  return signal ?? AbortSignal.timeout(timeoutMs);
+}
+
+export async function attemptAutoResume(options: {
+  record: TaskRecord;
+  agent: AgentDefinition | undefined;
+  acquire: (signal?: AbortSignal) => Promise<void>;
+  resume: () => Promise<LiveTask>;
+  release: () => void;
+  signal?: AbortSignal;
+}): Promise<AutoResumeOutcome> {
+  if (!options.agent) {
+    return { ok: false, record: options.record, error: `Agent definition no longer exists: ${options.record.agent}` };
+  }
+  try {
+    await options.acquire(quotaAcquireSignal(options.signal));
+  } catch (error) {
+    return { ok: false, record: options.record, error: error instanceof Error ? error.message : String(error) };
+  }
+  try {
+    const resumed = await options.resume();
+    return { ok: true, record: resumed.record };
+  } catch (error) {
+    options.release();
+    return { ok: false, record: options.record, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export function shouldOrphanRestoredTask(
+  record: Pick<TaskRecord, "id" | "status">,
+  liveIds: { has(id: string): boolean },
+  resumingIds: { has(id: string): boolean } = new Set<string>(),
+): boolean {
+  return record.status === "running" && !liveIds.has(record.id) && !resumingIds.has(record.id);
+}
+
+/** Persist recoverable parent_shutdown before a later reload can classify records as orphaned. */
+export async function persistLiveTasksForParentShutdown(
+  tasks: Iterable<LiveTask>,
+  persist: (record: TaskRecord) => Promise<void> = persistTask,
+): Promise<void> {
+  for (const task of [...tasks]) {
+    void task.stop("parent_shutdown").catch(() => {});
+    // requestStop runs synchronously inside stop(); persist before waiting for any
+    // provider/child abort so a later reload cannot still see a running record.
+    if (task.record.status === "running") {
+      task.record.status = "stopped";
+      task.record.terminationKind = "parent_shutdown";
+      task.record.error = "Parent session shut down.";
+      task.record.completedAt ??= new Date().toISOString();
+    }
+    await persist(task.record);
+  }
 }
 
 export interface CompletionDeduper {
@@ -577,6 +643,7 @@ export default function register(pi: ExtensionAPI): void {
   let currentDiagnostics = [...initialDiscovery.diagnostics, ...initialModels.diagnostics, ...initialApplied.diagnostics];
   let parentSessionId = "unknown";
   const live = new Map<string, LiveTask>();
+  const resuming = new Set<string>();
   const known = new Map<string, TaskRecord>();
   const taskQuota = createTaskQuota(currentConfig.maxConcurrentTasks);
   const quotaTasks = new Set<string>();
@@ -592,6 +659,61 @@ export default function register(pi: ExtensionAPI): void {
   });
   const { notifyCompletion, notifyProgressWarning } = notifiers;
 
+  // One interruption-recovery notice per parent session in this process.
+  // `session_start` fires on startup, reload, new, resume, and fork; off mode
+  // and empty candidate lists must not consume eligibility for a later start.
+  const interruptedNoticeSessions = new Set<string>();
+
+  const resumeInterruptedTask = async (ctx: ExtensionContext, record: TaskRecord): Promise<AutoResumeOutcome> => {
+    resuming.add(record.id);
+    try {
+      const agent = findAgent(currentAgents, record.agent);
+      return await attemptAutoResume({
+        record,
+        agent,
+        acquire: signal => taskQuota.acquire(1, signal),
+        release: () => taskQuota.release(),
+        signal: ctx.signal,
+        resume: async () => {
+          if (!agent) throw new Error(`Agent definition no longer exists: ${record.agent}`);
+          let invocation: number | undefined;
+          const resumeRecord = structuredClone(record);
+          const resumed = await resumeCompletedTask({
+            record: resumeRecord,
+            onPrepared: () => {
+              invocation = notifiers.beginInvocation(record.id);
+              known.set(record.id, resumeRecord);
+              quotaTasks.add(record.id);
+            },
+            message: "Your session was interrupted by a parent shutdown. Resume exactly where you left off: restate nothing you already established, reuse your earlier findings, and deliver your final report.",
+            agent,
+            agents: currentAgents,
+            parent: {
+              ...currentParent(pi, ctx),
+              parentSessionId: record.rootParentSessionId ?? record.parentSessionId,
+              rootParentSessionId: record.rootParentSessionId ?? record.parentSessionId,
+              parentTaskId: record.parentTaskId,
+              depth: Math.max(0, (record.depth ?? 1) - 1),
+              taskQuota,
+            },
+            config: currentConfig,
+            onTaskStarted: nested => {
+              known.set(nested.record.id, nested.record);
+              live.set(nested.record.id, nested);
+              quotaTasks.add(nested.record.id);
+            },
+            onComplete: r => notifyCompletion(r, r.id === record.id ? invocation : undefined),
+            onProgressWarning: (r, details) => notifyProgressWarning(r, details, r.id === record.id ? invocation : undefined),
+          });
+          if (resumed.record.completedAt === undefined) live.set(record.id, resumed);
+          return resumed;
+        },
+      });
+    } finally {
+      resuming.delete(record.id);
+    }
+  };
+
   const reload = (ctx: ExtensionContext) => {
     const includeProject = ctx.isProjectTrusted();
     const loadedConfig = loadConfig(ctx.cwd, includeProject);
@@ -606,7 +728,7 @@ export default function register(pi: ExtensionAPI): void {
     known.clear();
     const records = loadTaskRecords(parentSessionId);
     for (const record of records) {
-      if (record.status === "running" && !live.has(record.id)) {
+      if (shouldOrphanRestoredTask(record, live, resuming)) {
         record.status = "failed";
         record.error = "Task was orphaned by a previous Pi process or session reload.";
         record.completedAt = new Date().toISOString();
@@ -636,6 +758,43 @@ export default function register(pi: ExtensionAPI): void {
   pi.on("session_start", (_event, ctx) => {
     reload(ctx);
     void cleanupExpiredTasks(currentConfig.cleanupPeriodDays);
+    const mode = currentConfig.interruptedTaskResume;
+    const candidates = selectInterruptedTasks(loadTaskRecords(parentSessionId));
+    const resumable = candidates.filter(candidate => isResumableInterruptedTask(candidate.record));
+    if (!shouldOfferInterruptedRecovery({
+      sessionId: parentSessionId,
+      notifiedSessionIds: interruptedNoticeSessions,
+      mode,
+      resumableCount: resumable.length,
+    })) return;
+    interruptedNoticeSessions.add(parentSessionId);
+    if (mode === "auto") {
+      void (async () => {
+        const outcomes: AutoResumeOutcome[] = [];
+        for (const candidate of resumable) {
+          outcomes.push(await resumeInterruptedTask(ctx, candidate.record));
+        }
+        const failures = outcomes.filter((outcome): outcome is Extract<AutoResumeOutcome, { ok: false }> => !outcome.ok);
+        const notice = formatInterruptedTasksNotice(candidates, {
+          autoResumed: failures.length === 0,
+          failures,
+        });
+        if (!notice) return;
+        sendParentNotification(
+          pi,
+          { customType: "pi-subagent-interrupted-tasks", content: notice, display: true, details: { autoResumed: failures.length === 0, failures } },
+          { triggerTurn: true, deliverAs: "followUp" },
+        );
+      })();
+      return;
+    }
+    const notice = formatInterruptedTasksNotice(candidates);
+    if (!notice) return;
+    sendParentNotification(
+      pi,
+      { customType: "pi-subagent-interrupted-tasks", content: notice, display: true, details: { autoResumed: false } },
+      { triggerTurn: true, deliverAs: "followUp" },
+    );
   });
 
   pi.on("before_agent_start", (event, ctx) => {
@@ -657,10 +816,13 @@ export default function register(pi: ExtensionAPI): void {
   pi.on("turn_end", () => notifiers.onTurnEnd());
   pi.on("agent_settled", () => notifiers.onAgentSettled());
 
-  pi.on("session_shutdown", () => {
+  pi.on("session_shutdown", async () => {
     notifiers.onSessionShutdown();
-    for (const task of live.values()) void task.stop("parent_shutdown");
-    live.clear();
+    const shuttingDown = [...live.values()];
+    // Keep live handles until persist finishes so a concurrent reload cannot
+    // orphan a task that is still in the shutdown write.
+    await persistLiveTasksForParentShutdown(shuttingDown);
+    for (const task of shuttingDown) live.delete(task.record.id);
   });
 
   pi.registerMessageRenderer<TaskRecord>("pi-subagent-notification", (message, options, theme) => {
@@ -702,6 +864,20 @@ export default function register(pi: ExtensionAPI): void {
       return `${icon} ${theme.bold(record.description)} ${theme.fg("dim", record.status)}`;
     });
     return new Text(lines.length ? lines.join("\n") : "Subagent notifications", 0, 0);
+  });
+
+  pi.registerMessageRenderer<{ autoResumed?: boolean }>("pi-subagent-interrupted-tasks", (message, _options, theme) => {
+    const content = typeof message.content === "string" ? message.content : "Interrupted subagent tasks are recoverable";
+    const lines = content.split("\n").filter((line) => line.startsWith("- ")).map((line) => `${theme.fg("warning", "■")} ${line.slice(2)}`);
+    const autoResumed = Boolean(message.details?.autoResumed);
+    const hint = autoResumed
+      ? "(parent shutdown; resumed automatically)"
+      : "(parent shutdown; SendMessage to continue)";
+    return new Text(
+      [`${theme.fg("warning", "↻")} ${theme.bold("Interrupted background tasks")} ${theme.fg("dim", hint)}`, ...lines].join("\n"),
+      0,
+      0,
+    );
   });
 
   pi.registerTool({
@@ -897,6 +1073,7 @@ export default function register(pi: ExtensionAPI): void {
       } catch (error) {
         return taskResult([record], error instanceof Error ? error.message : String(error), true);
       }
+      resuming.add(record.id);
       try {
         // Preparation works on a separate record. Only a successful initial
         // persistence commits the new notification generation; failed resume
@@ -935,6 +1112,8 @@ export default function register(pi: ExtensionAPI): void {
       } catch (error) {
         taskQuota.release();
         return taskResult([record], error instanceof Error ? error.message : String(error), true);
+      } finally {
+        resuming.delete(record.id);
       }
     },
   });
