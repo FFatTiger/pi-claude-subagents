@@ -12,6 +12,8 @@ import {
   defineTool,
   getAgentDir,
   resolveCliModel,
+  type AgentSessionEvent,
+  type EventBus,
   type ExtensionFactory,
   type Skill,
   type ToolDefinition,
@@ -30,7 +32,7 @@ import {
 import { buildChildBoundary, resolveTaskIsolation } from "./prompts.ts";
 import {
   appendTaskOutput,
-  createUnpersistedTaskRecord,
+  createTaskRecord,
   extractFinalText,
   extractInvocationText,
   formatInvocationOutput,
@@ -260,6 +262,47 @@ export interface ParentLaunchContext {
   taskQuota?: TaskQuota;
   availableModels?: Array<{ provider: string; id: string }>;
   projectTrusted: boolean;
+  /** Parent session event bus used to forward child stream events. Absent in embedded/test launches. */
+  events?: EventBus;
+}
+
+/** Event-bus channel on which child-session stream events are forwarded to the parent session. */
+export const SUBAGENT_CHILD_EVENT_CHANNEL = "pi-claude-subagents:child-event";
+
+/** Payload emitted on {@link SUBAGENT_CHILD_EVENT_CHANNEL} for each forwarded child stream event. */
+export interface SubagentChildEvent {
+  /** Child session the event came from (the live child session for launches, the reopened session for resumes). */
+  childSessionId: string;
+  /** Task record id the child belongs to. */
+  taskId: string;
+  /** The raw child-session stream event (`message_update`, or `message_end` for assistant messages). */
+  event: AgentSessionEvent;
+}
+
+/**
+ * Forward one child-session stream event to the parent session's event bus.
+ *
+ * Only `message_update` and assistant `message_end` events are forwarded, so
+ * embedders can render child output live. Nothing is written to any session
+ * file; when no bus is attached (or no listener subscribes) this is a no-op,
+ * and listener or emitter failures must never affect the child run.
+ */
+export function forwardChildStreamEvent(options: {
+  events?: EventBus;
+  childSessionId: string | undefined;
+  taskId: string;
+  event: AgentSessionEvent;
+}): void {
+  const { events, childSessionId, taskId, event } = options;
+  if (!events || !childSessionId) return;
+  const isStreamUpdate = event.type === "message_update";
+  const isAssistantEnd = event.type === "message_end" && event.message.role === "assistant";
+  if (!isStreamUpdate && !isAssistantEnd) return;
+  try {
+    events.emit(SUBAGENT_CHILD_EVENT_CHANNEL, { childSessionId, taskId, event } satisfies SubagentChildEvent);
+  } catch {
+    // A throwing listener must never affect the subagent run.
+  }
 }
 
 interface WorktreeInfo {
@@ -863,7 +906,13 @@ export async function launchTask(options: {
     fallbackTurns: options.config.warningTurns,
     fallbackInterval: options.config.warningIntervalTurns,
   });
-  const record = await createUnpersistedTaskRecord({
+  // The running record is persisted and published before launchTask returns, so
+  // embedders (and a crash or reload during startup) can observe the task
+  // immediately. This stays honest with the v0.3.9 interruption recovery:
+  // startup failures still delete the task directory when no child session was
+  // created, recovery only resumes stopped/parent_shutdown records, and the
+  // session_start orphan sweep fails a running record left by a crash.
+  const record = await createTaskRecord({
     parentSessionId: options.parent.parentSessionId,
     rootParentSessionId: options.parent.rootParentSessionId ?? options.parent.parentSessionId,
     parentTaskId: options.parent.parentTaskId,
@@ -892,6 +941,7 @@ export async function launchTask(options: {
     forkSystemPrompt: options.spec.forked ? options.parent.parentSystemPrompt : undefined,
     name: options.spec.name,
   });
+  options.onUpdate?.(record);
   const abortController = new AbortController();
   let resolveForegroundReleased!: () => void;
   const foregroundReleased = new Promise<void>(resolve => {
@@ -999,6 +1049,12 @@ export async function launchTask(options: {
           }
           await persistTask(record);
           const unsubscribe = childSession.subscribe(event => {
+            forwardChildStreamEvent({
+              events: options.parent.events,
+              childSessionId: childSession?.sessionId,
+              taskId: record.id,
+              event,
+            });
             if (event.type === "message_end") {
               messages.push(event.message);
               if (event.message.role === "assistant") {
@@ -1458,7 +1514,14 @@ export async function resumeCompletedTask(options: {
         modelReasoning: childSession.model?.reasoning,
         availableLevels: childSession.getAvailableThinkingLevels(),
       });
+      const resumeChildSessionId = sessionManager.getSessionId();
       unsubscribe = childSession.subscribe(event => {
+        forwardChildStreamEvent({
+          events: options.parent?.events,
+          childSessionId: resumeChildSessionId,
+          taskId: options.record.id,
+          event,
+        });
         if (event.type !== "message_end") return;
         messages.push(event.message);
         if (event.message.role === "assistant") applyAssistantTokenUsage(options.record, event.message);

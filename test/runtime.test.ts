@@ -4,12 +4,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ExtensionFactory } from "@earendil-works/pi-coding-agent";
+import { createEventBus, type AgentSessionEvent, type ExtensionFactory } from "@earendil-works/pi-coding-agent";
 import { discoverAgents, findAgent } from "../src/agents.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { createChildLifecycleController } from "../src/lifecycle.ts";
 import {
   FINAL_HANDOFF_DIRECTIVE,
+  SUBAGENT_CHILD_EVENT_CHANNEL,
   applyResumeCapabilities,
   applyAssistantTokenUsage,
   applyLifecycleUsage,
@@ -17,6 +18,8 @@ import {
   createChildLifecycleExtension,
   deriveThinkingClampReason,
   finalizeInvocationRecord,
+  forwardChildStreamEvent,
+  launchTask,
   resolveResumeCapabilities,
   type LifecycleUsageBaseline,
 } from "../src/runtime.ts";
@@ -426,4 +429,133 @@ test("one-turn budget keeps the first turn usable and wraps up in grace", async 
   await handlers.get("turn_start")!({ type: "turn_start", turnIndex: 1 }, ctx);
   assert.equal(lifecycle.snapshot.phase, "final_handoff");
   assert.deepEqual(await handlers.get("tool_call")!({ toolName: "read", input: { path: "README.md" } }, ctx), undefined);
+});
+
+// --- child stream event forwarding ---
+
+function sessionEvent(value: unknown): AgentSessionEvent {
+  return value as AgentSessionEvent;
+}
+
+function recordingBus(emit?: (channel: string, data: unknown) => void) {
+  const calls: Array<{ channel: string; data: unknown }> = [];
+  return {
+    calls,
+    bus: {
+      emit(channel: string, data: unknown) {
+        calls.push({ channel, data });
+        emit?.(channel, data);
+      },
+      on() {
+        return () => {};
+      },
+    },
+  };
+}
+
+test("child stream forwarding emits message_update and assistant message_end on the channel", () => {
+  const { calls, bus } = recordingBus();
+  const update = sessionEvent({ type: "message_update", message: { role: "assistant", content: [] } });
+  const assistantEnd = sessionEvent({ type: "message_end", message: { role: "assistant", content: [] } });
+
+  forwardChildStreamEvent({ events: bus, childSessionId: "child-1", taskId: "task-1", event: update });
+  forwardChildStreamEvent({ events: bus, childSessionId: "child-1", taskId: "task-1", event: assistantEnd });
+
+  assert.deepEqual(calls.map(call => call.channel), [SUBAGENT_CHILD_EVENT_CHANNEL, SUBAGENT_CHILD_EVENT_CHANNEL]);
+  assert.notEqual(calls[0]!.data, update, "payload wraps the event instead of forwarding it bare");
+  const payload = calls[0]!.data as { childSessionId: string; taskId: string; event: unknown };
+  assert.equal(payload.childSessionId, "child-1");
+  assert.equal(payload.taskId, "task-1");
+  assert.equal(payload.event, update);
+  const endPayload = calls[1]!.data as { event: unknown };
+  assert.equal(endPayload.event, assistantEnd);
+});
+
+test("child stream forwarding skips non-assistant message_end and non-stream events", () => {
+  const { calls, bus } = recordingBus();
+  forwardChildStreamEvent({ events: bus, childSessionId: "child-1", taskId: "task-1", event: sessionEvent({ type: "message_end", message: { role: "toolResult", content: [] } }) });
+  forwardChildStreamEvent({ events: bus, childSessionId: "child-1", taskId: "task-1", event: sessionEvent({ type: "turn_start", turnIndex: 0 }) });
+  forwardChildStreamEvent({ events: bus, childSessionId: "child-1", taskId: "task-1", event: sessionEvent({ type: "message_start", message: { role: "user", content: [] } }) });
+  assert.equal(calls.length, 0);
+});
+
+test("child stream forwarding is a no-op without a bus or child session id", () => {
+  const event = sessionEvent({ type: "message_update", message: { role: "assistant", content: [] } });
+  forwardChildStreamEvent({ childSessionId: "child-1", taskId: "task-1", event });
+  const { calls, bus } = recordingBus();
+  forwardChildStreamEvent({ events: bus, childSessionId: undefined, taskId: "task-1", event });
+  assert.equal(calls.length, 0);
+});
+
+test("a throwing emitter or listener never affects the child run", () => {
+  const event = sessionEvent({ type: "message_update", message: { role: "assistant", content: [] } });
+  // The emitter itself throws (a synchronous listener failure on a raw bus).
+  const throwing = recordingBus(() => {
+    throw new Error("listener exploded");
+  });
+  forwardChildStreamEvent({ events: throwing.bus, childSessionId: "child-1", taskId: "task-1", event });
+  assert.equal(throwing.calls.length, 1);
+  // Forwarding continues afterwards; nothing is poisoned by the earlier failure.
+  const healthy = recordingBus();
+  forwardChildStreamEvent({ events: healthy.bus, childSessionId: "child-1", taskId: "task-1", event });
+  assert.equal(healthy.calls.length, 1);
+  // Pi's real bus wraps handlers so listener throws are logged, not propagated.
+  const real = createEventBus();
+  const seen: unknown[] = [];
+  real.on(SUBAGENT_CHILD_EVENT_CHANNEL, (data: unknown) => {
+    seen.push(data);
+    throw new Error("async listener exploded");
+  });
+  forwardChildStreamEvent({ events: real, childSessionId: "child-2", taskId: "task-2", event });
+  assert.equal(seen.length, 1);
+  forwardChildStreamEvent({ events: real, childSessionId: "child-2", taskId: "task-2", event });
+  assert.equal(seen.length, 2);
+});
+
+test("launch persists and publishes the running record before returning", async () => {
+  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agent-dir-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-launch-cwd-"));
+  const general = findAgent(discoverAgents({ cwd: packageRoot, packageRoot, includeProject: false }).agents, "general-purpose")!;
+  const updates: TaskRecord[] = [];
+  const completions: TaskRecord[] = [];
+  try {
+    const task = await launchTask({
+      spec: {
+        agent: general,
+        prompt: "test",
+        description: "persist before return",
+        cwd,
+        background: true,
+        forked: false,
+        warningTurns: 40,
+        warningIntervalTurns: 25,
+      },
+      parent: { parentSessionId: `launch-persist-${process.pid}-${Date.now()}`, projectTrusted: false },
+      config: { ...DEFAULT_CONFIG },
+      onComplete: record => completions.push(record),
+      onUpdate: record => updates.push(record),
+    });
+    // The running record is durable before launchTask returns.
+    assert.ok(fs.existsSync(task.record.taskFile));
+    assert.equal((JSON.parse(fs.readFileSync(task.record.taskFile, "utf8")) as TaskRecord).status, "running");
+    // And it was published to onUpdate immediately.
+    assert.equal(updates.length, 1);
+    assert.equal(updates[0]!.id, task.record.id);
+    assert.equal(updates[0]!.status, "running");
+    assert.equal(updates[0]!.sessionFile, undefined);
+    // The startup failure is honest: failed record, completion callback, directory removed.
+    const finalized = await task.promise;
+    assert.equal(finalized.status, "failed");
+    assert.equal(finalized.terminationKind, "startup_error");
+    assert.equal(completions.length, 1);
+    assert.equal(completions[0]!.status, "failed");
+    assert.equal(fs.existsSync(path.dirname(task.record.taskFile)), false);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    fs.rmSync(agentDir, { recursive: true, force: true });
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
 });

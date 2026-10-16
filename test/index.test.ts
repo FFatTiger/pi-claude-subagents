@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import register, {
+  AGENT_LISTING_CUSTOM_TYPE,
   AgentParams,
   TaskSpecSchema,
   buildNotificationMessage,
@@ -13,12 +14,13 @@ import register, {
   inheritTaskWarningPolicy,
   isStaleExtensionContextError,
   progressWarningNotification,
+  shouldInjectAgentListing,
   taskNotification,
   waitForLaunchedForegroundTasks,
 } from "../src/index.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { createTaskQuota, type ProgressWarningDetails } from "../src/runtime.ts";
-import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { appendTaskOutput, formatTaskOutputForModel, saveTaskOutput, type LiveTask, type TaskRecord } from "../src/tasks.ts";
 
 function partialTask(): TaskRecord {
@@ -867,4 +869,116 @@ test("interrupted-tasks renderer stays honest for auto vs notify", () => {
   ).render(120).join("\n");
   assert.match(autoText, /resumed automatically/);
   assert.equal(autoText.includes("SendMessage"), false);
+});
+
+// --- agent-listing injection dedup ---
+
+function listingEntry(content: unknown, form: "message" | "custom_message" = "message"): SessionEntry {
+  return (form === "message"
+    ? {
+      type: "message",
+      id: "entry-listing",
+      parentId: null,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      message: { role: "custom", customType: AGENT_LISTING_CUSTOM_TYPE, content, display: false, timestamp: 0 },
+    }
+    : {
+      type: "custom_message",
+      id: "entry-listing",
+      parentId: null,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      customType: AGENT_LISTING_CUSTOM_TYPE,
+      content,
+      display: false,
+    }) as unknown as SessionEntry;
+}
+
+function compactionEntry(): SessionEntry {
+  return { type: "compaction", id: "entry-compaction", parentId: null, timestamp: "2026-01-01T00:00:00.000Z" } as unknown as SessionEntry;
+}
+
+function unrelatedCustom(): SessionEntry {
+  return { type: "custom", id: "entry-custom", parentId: null, timestamp: "2026-01-01T00:00:00.000Z", customType: "someone-else" } as unknown as SessionEntry;
+}
+
+test("agent listing injects only without a fresh identical listing in the branch", () => {
+  const listing = "<agent-listing>\n- general-purpose: does things\n</agent-listing>";
+  // First turn in a session: nothing persisted yet.
+  assert.equal(shouldInjectAgentListing({ branch: [], listingContent: listing }), true);
+  // Same listing already in context (both persisted shapes): skip.
+  assert.equal(shouldInjectAgentListing({ branch: [listingEntry(listing)], listingContent: listing }), false);
+  assert.equal(shouldInjectAgentListing({ branch: [listingEntry(listing, "custom_message")], listingContent: listing }), false);
+  // Unrelated entries in between do not hide the listing.
+  assert.equal(shouldInjectAgentListing({ branch: [listingEntry(listing), unrelatedCustom()], listingContent: listing }), false);
+  // Changed listing content (config or agents changed): inject again.
+  assert.equal(shouldInjectAgentListing({ branch: [listingEntry(listing)], listingContent: `${listing}\n- new: added` }), true);
+  // Non-string listing content cannot be compared: inject.
+  assert.equal(shouldInjectAgentListing({ branch: [listingEntry([{ type: "text", text: "x" }])], listingContent: listing }), true);
+});
+
+test("agent listing re-injects after compaction removed it from context", () => {
+  const listing = "<agent-listing>\n- general-purpose: does things\n</agent-listing>";
+  // Compaction after the last listing: the listing left the context.
+  assert.equal(shouldInjectAgentListing({ branch: [listingEntry(listing), compactionEntry()], listingContent: listing }), true);
+  // A listing already after the latest compaction and identical: skip again.
+  assert.equal(
+    shouldInjectAgentListing({ branch: [compactionEntry(), listingEntry(listing)], listingContent: listing }),
+    false,
+  );
+  // Stale listing before the compaction with changed content: inject (both reasons agree).
+  assert.equal(shouldInjectAgentListing({ branch: [listingEntry("old"), compactionEntry()], listingContent: listing }), true);
+});
+
+test("before_agent_start injects the listing once per session and again after compaction", () => {
+  const sessionId = `listing-dedupe-${process.pid}-${Date.now()}`;
+  const reg = registrationPi();
+  register(reg.pi);
+  const handler = reg.handlers.get("before_agent_start") as
+    (event: unknown, ctx: unknown) => { message?: { customType: string; content: string; display: boolean }; systemPrompt: string } | undefined;
+  let branch: SessionEntry[] = [];
+  const base = sessionCtx(sessionId);
+  const ctx = {
+    ...base,
+    sessionManager: { ...base.sessionManager, getBranch: () => branch },
+  };
+  const event = { type: "before_agent_start", messageType: "user", systemPrompt: "BASE" };
+
+  // First turn: the listing enters context and the parent policy is appended to the system prompt.
+  const first = handler(event, ctx)!;
+  assert.ok(first.message);
+  assert.equal(first.message.customType, AGENT_LISTING_CUSTOM_TYPE);
+  assert.equal(first.message.display, false);
+  assert.match(first.message.content, /^<agent-listing>\n/);
+  assert.match(first.systemPrompt, /^BASE\n\n# Subagent orchestration/);
+
+  // The persisted listing makes later turns (including Pi 1.3 triggerTurn runs) skip the message.
+  branch = [listingEntry(first.message.content)];
+  const second = handler(event, ctx)!;
+  assert.equal(second.message, undefined);
+  assert.equal(second.systemPrompt, first.systemPrompt);
+
+  // A compaction after the listing restores injection; identical content still skips afterwards.
+  branch = [listingEntry(first.message.content), compactionEntry()];
+  const third = handler(event, ctx)!;
+  assert.ok(third.message);
+  assert.equal(third.message.content, first.message.content);
+  branch = [compactionEntry(), listingEntry(first.message.content)];
+  assert.equal(handler(event, ctx)!.message, undefined);
+});
+
+test("before_agent_start stays fully silent when proactivePrompt is disabled", () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-listing-off-"));
+  const dir = path.join(cwd, ".pi");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "pi-claude-subagents.json"), JSON.stringify({ proactivePrompt: false }));
+  try {
+    const reg = registrationPi();
+    register(reg.pi);
+    const handler = reg.handlers.get("before_agent_start") as (event: unknown, ctx: unknown) => unknown;
+    const base = sessionCtx(`listing-off-${process.pid}-${Date.now()}`, cwd, true);
+    const ctx = { ...base, sessionManager: { ...base.sessionManager, getBranch: () => [] } };
+    assert.equal(handler({ type: "before_agent_start", messageType: "user", systemPrompt: "BASE" }, ctx), undefined);
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
 });

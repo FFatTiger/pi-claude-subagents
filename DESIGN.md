@@ -17,6 +17,11 @@ interface AgentOrchestrator {
 
 The Pi extension adapter exposes this seam as `Agent`, `SendMessage`, `TaskOutput`, and `TaskStop`.
 
+Embedders additionally get two observable side channels:
+
+- **Child stream events.** Launch and resume forward the child session's `message_update` and assistant `message_end` stream events onto the parent session's Pi event bus (`pi.events.emit`) on the channel `pi-claude-subagents:child-event` (exported as `SUBAGENT_CHILD_EVENT_CHANNEL`) with payload `{ childSessionId, taskId, event }`. `childSessionId` is the live child session id for launches and `sessionManager.getSessionId()` for resumes. Nothing is persisted; with no bus attached or no listener subscribed this is a no-op, and listener/emitter failures are swallowed so they can never affect the child run.
+- **Persist-before-return.** A launch writes the running `task.json` and publishes it through the tool update callback before `launchTask` returns, so a crash or reload during startup leaves an honest `running` record that the next session's orphan sweep fails (recovery only resumes `stopped`/`parent_shutdown` records, and startup failures without a child session still delete the task directory).
+
 ## Modules
 
 - `src/index.ts` — Pi extension registration, root-session state, tool/command adapters, notifications, interruption recovery
@@ -100,6 +105,8 @@ The parent contract covers:
 - bounded, restrained nested delegation
 
 Child contracts define role, scope, evidence, instructed access, delegation depth, and handoff shape. Read-only role constraints are prompt-only: all bundled roles may receive full tools and unrestricted Bash, so runtime capability availability does not replace the role instruction.
+
+The hidden `pi-subagent-agent-listing` reminder is context, so it is injected only when the current branch does not already carry the same listing after the latest compaction: first run of a session, after a compaction removed it, or when the listing content changed (agent/config edits). Reload/resume/fork sessions are covered by scanning the persisted branch. The parent policy appended to the system prompt is re-derived every run because it does not accumulate context.
 
 ## Lifecycle semantics
 
@@ -191,7 +198,7 @@ Runtime-enforced controls are:
 
 ## Persistence
 
-Task metadata and output artifacts:
+Task records are durable from the moment a launch returns (persist-before-return; see External seam).
 
 ```text
 <getAgentDir()>/pi-claude-subagents/<root-session-id>/<task-id>/

@@ -100,7 +100,7 @@ mock.module(sdkURL, {
     ModelRuntime: { create: async () => ({}) },
     SettingsManager: { create: () => ({}) },
     DefaultResourceLoader: Loader,
-    SessionManager: { create: () => ({}), open: () => ({}) },
+    SessionManager: { create: () => ({}), open: () => ({ getSessionId: () => "offline-resume-session" }) },
     resolveCliModel: () => ({ model }),
     createAgentSession: async options => {
       const handlers = new Map();

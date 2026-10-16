@@ -6,6 +6,7 @@ import {
   type AgentToolResult,
   type ExtensionAPI,
   type ExtensionContext,
+  type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -22,6 +23,8 @@ import {
 import { resolveWarningSchedule } from "./lifecycle.ts";
 import { buildAgentListing, buildAgentToolDescription, buildParentPolicy, classifyDispatch, resolveTaskIsolation } from "./prompts.ts";
 import { launchTask, resumeCompletedTask, createTaskQuota, type LaunchSpec, type ParentLaunchContext, type ProgressWarningDetails, type TaskQuota } from "./runtime.ts";
+export { SUBAGENT_CHILD_EVENT_CHANNEL, forwardChildStreamEvent } from "./runtime.ts";
+export type { SubagentChildEvent } from "./runtime.ts";
 import {
   cleanupExpiredTasks,
   formatTaskTargetError,
@@ -34,6 +37,52 @@ import {
 } from "./tasks.ts";
 
 const packageRoot = resolvePackageRoot(import.meta.url);
+
+/** Custom message type of the hidden agent-listing reminder injected into parent context. */
+export const AGENT_LISTING_CUSTOM_TYPE = "pi-subagent-agent-listing";
+
+/** Content of the agent listing as injected into the session (also the dedup comparison key). */
+export function buildAgentListingMessage(agents: AgentDefinition[], config: PiSubagentsConfig): string {
+  return `<agent-listing>\n${buildAgentListing(agents, config)}\n</agent-listing>`;
+}
+
+function persistedListingContent(entry: SessionEntry): string | undefined {
+  if (entry.type === "custom_message" && entry.customType === AGENT_LISTING_CUSTOM_TYPE) {
+    return typeof entry.content === "string" ? entry.content : undefined;
+  }
+  if (entry.type === "message") {
+    const message = entry.message as { role?: string; customType?: string; content?: unknown };
+    if (message.role === "custom" && message.customType === AGENT_LISTING_CUSTOM_TYPE) {
+      return typeof message.content === "string" ? message.content : undefined;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Decide whether the agent listing must be (re)injected before this run.
+ *
+ * The listing is context, and Pi 1.3 also fires before_agent_start for
+ * triggerTurn runs (for example subagent completion notifications), so an
+ * unconditional injection would repeat the same listing every turn. Scan the
+ * current branch backwards: the latest listing after the latest compaction
+ * with identical content means the context already carries it, so skip; a
+ * compaction after the last listing, a changed listing, or no listing at all
+ * means inject. Reload/resume/fork sessions are covered by the same branch
+ * scan because the previous listing is part of the persisted session.
+ */
+export function shouldInjectAgentListing(options: {
+  branch: readonly SessionEntry[];
+  listingContent: string;
+}): boolean {
+  for (let i = options.branch.length - 1; i >= 0; i--) {
+    const entry = options.branch[i]!;
+    if (entry.type === "compaction") return true;
+    const content = persistedListingContent(entry);
+    if (content !== undefined) return content !== options.listingContent;
+  }
+  return true;
+}
 
 interface TaskDetails {
   tasks: TaskRecord[];
@@ -536,6 +585,7 @@ function currentParent(pi: ExtensionAPI, ctx: ExtensionContext): ParentLaunchCon
   const activeTools = new Set(pi.getActiveTools());
   return {
     parentSessionId: ctx.sessionManager.getSessionId(),
+    events: pi.events,
     rootParentSessionId: ctx.sessionManager.getSessionId(),
     depth: 0,
     parentSessionFile: ctx.sessionManager.getSessionFile(),
@@ -799,14 +849,16 @@ export default function register(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", (event, ctx) => {
     reload(ctx);
+    // The parent policy is re-derived from the current system prompt every turn and never accumulates context.
+    const systemPrompt = `${event.systemPrompt}\n\n${buildParentPolicy(currentAgents, currentConfig)}`;
     if (!currentConfig.proactivePrompt) return;
+    const listingContent = buildAgentListingMessage(currentAgents, currentConfig);
+    if (!shouldInjectAgentListing({ branch: ctx.sessionManager.getBranch(), listingContent })) {
+      return { systemPrompt };
+    }
     return {
-      message: {
-        customType: "pi-subagent-agent-listing",
-        content: `<agent-listing>\n${buildAgentListing(currentAgents, currentConfig)}\n</agent-listing>`,
-        display: false,
-      },
-      systemPrompt: `${event.systemPrompt}\n\n${buildParentPolicy(currentAgents, currentConfig)}`,
+      message: { customType: AGENT_LISTING_CUSTOM_TYPE, content: listingContent, display: false },
+      systemPrompt,
     };
   });
 

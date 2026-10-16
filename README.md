@@ -2,7 +2,7 @@
 
 Pi package for multi-agent orchestration: specialist roles, inherited-context workers, parallel investigation, background completion, continuation, verification, and bounded nesting — all on Pi-native sessions, tools, and lifecycle.
 
-Compatible with Pi packages **>= 1.0.0 < 2** (verified against 1.0.0). MIT license.
+Compatible with Pi packages **>= 1.0.0 < 2** (verified against 1.3.0). MIT license.
 
 ## Install
 
@@ -332,6 +332,31 @@ Task metadata and output artifacts:
 
 Child session JSONL lives in Pi's standard session catalogue (`<getAgentDir()>/sessions/<project>/...`, normally `~/.pi/agent/sessions/<project>/...`), colocated with the parent session when a parent session file is available. `TaskRecord.sessionFile` stores that external standard path. Task cleanup removes only task metadata/output directories and does not delete standard child sessions.
 
+The running `task.json` is written **before the launch call returns** (and immediately published through the launching tool's update callback), so embedders and a crash/reload during startup can observe the task from its first moment. Startup failures still delete the task directory when no child session was created, and interruption recovery only resumes `stopped`/`parent_shutdown` records, so a crash mid-startup is honestly failed by the next session's orphan sweep instead of being resumed.
+
+## Child stream events (extension API)
+
+Embedders that render child output live (for example a web UI hosting this package) can subscribe to child stream events on the **parent session's event bus** (`pi.events`, one bus per session):
+
+```ts
+import { SUBAGENT_CHILD_EVENT_CHANNEL } from "pi-claude-subagents";
+
+const unsubscribe = pi.events.on(SUBAGENT_CHILD_EVENT_CHANNEL, data => {
+  const { childSessionId, taskId, event } = data as {
+    childSessionId: string;
+    taskId: string;
+    event:
+      | { type: "message_update"; /* ... */ }
+      | { type: "message_end"; message: { role: "assistant"; /* ... */ } };
+  };
+});
+```
+
+- Channel: `pi-claude-subagents:child-event` (exported as `SUBAGENT_CHILD_EVENT_CHANNEL`; the channel string is the stable contract, the export is convenience).
+- Payload: `{ childSessionId, taskId, event }` — `childSessionId` is the live child session id for launches and the reopened persisted session id for resumes; `taskId` is the `TaskRecord.id`.
+- Only `message_update` and assistant `message_end` events are forwarded; nothing is written to any session file.
+- No listener means no work; a throwing listener (or bus) is swallowed and never affects the subagent run.
+
 ## Commands
 
 - `/agents` — list subagents and current tasks
@@ -339,12 +364,13 @@ Child session JSONL lives in Pi's standard session catalogue (`<getAgentDir()>/s
 
 ## Develop / validate
 
-Requirements: Node.js `>=22.19.0` and Pi packages `>= 1.0.0 < 2` (peer range; verified against 1.0.0).
+Requirements: Node.js `>=22.19.0` and Pi packages `>= 1.0.0 < 2` (peer range; verified against 1.3.0).
 
-Pi 1.0 compatibility notes:
+Pi 1.x compatibility notes:
 
 - Pi >= 1.0 persists the session file as soon as the first user message exists. `subagent_type: fork` therefore works from the first persisted user turn; a parent branch that has only in-memory setup entries (for example thinking-level changes) is still rejected as non-durable.
 - Background completion and progress-warning notifications are delivered through a send helper that recognizes Pi's stale-extension-ctx contract (`This extension ctx is stale after session replacement or reload.`). If the parent session was replaced or reloaded while a child was running, the already-persisted task record survives and the stale notification is dropped instead of crashing the parent process. Any other send error remains observable and is never swallowed.
+- Pi >= 1.3 also starts runs for extension messages with `triggerTurn` (for example this package's own completion notifications), so `before_agent_start` no longer injects the hidden `pi-subagent-agent-listing` reminder on every run. The listing is injected on the first run of a session, again after a context compaction removed it, and again whenever the listing content itself changed (agent/config edits). Reload/resume/fork sessions check the persisted branch, so an unchanged listing is never re-injected. The parent policy appended to the system prompt is still derived fresh every run.
 
 ```bash
 npm run check
